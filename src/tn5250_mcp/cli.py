@@ -62,7 +62,7 @@ def cmd_run(a) -> int:
                   blocked=([] if a.no_default_blocks else list(DEFAULT_BLOCKED)) + a.block)
     t = Terminal(a.host, a.port, tls=not a.no_tls, verify_tls=not a.insecure, flows=fs,
                  device_name=a.device_name, codepage=a.codepage, log_dir=a.log_dir,
-                 guard=guard, viewer_port=a.viewer_port)
+                 guard=guard, viewer_port=a.viewer_port, pace=a.pace)
     try:
         t.connect()
         if a.viewer_port is not None:
@@ -140,6 +140,8 @@ def main(argv: list[str] | None = None) -> None:
     r.add_argument("--viewer-port", type=int, default=None,
                    help="start the live viewer on this port (0 = any free port)")
     r.add_argument("--log-dir", default=os.environ.get("T5250_LOG_DIR"))
+    r.add_argument("--pace", type=float, default=float(os.environ.get("T5250_PACE", "0")),
+                   help="seconds to wait after each step (to watch in the viewer)")
     r.add_argument("--block", action="append", default=[], help="extra regex to refuse")
     r.add_argument("--no-default-blocks", action="store_true")
     r.add_argument("--json", action="store_true", help="print the result as JSON")

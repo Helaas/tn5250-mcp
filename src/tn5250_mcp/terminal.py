@@ -34,7 +34,7 @@ class Terminal:
                  session: str = "main", device_name: str | None = None, wide: bool = False,
                  codepage: str = "cp037", log_dir: str | None = None,
                  guard: Guard | None = None, viewer_port: int | None = None,
-                 timeout: float = 20.0):
+                 timeout: float = 20.0, pace: float = 0.0):
         self.host, self.port, self.tls, self.verify_tls = host, port, tls, verify_tls
         self.name, self.device_name, self.wide = session, device_name, wide
         self.timeout = timeout
@@ -46,7 +46,7 @@ class Terminal:
             self.flows = flows
         else:
             self.flows = FlowSet.load(list(flows))
-        self.runner = FlowRunner(self.mgr, self.flows or FlowSet())
+        self.runner = FlowRunner(self.mgr, self.flows or FlowSet(), pace=pace)
         self._viewer_port = viewer_port
         self.s: Session | None = None
 

@@ -4,10 +4,12 @@ pages poking localhost) plus a Host-header check (against DNS rebinding)."""
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import secrets
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib import resources
 from urllib.parse import parse_qs, urlparse
@@ -45,6 +47,9 @@ def start_viewer(mgr: Manager, port: int) -> str:
     stdio server from a second MCP client, say), fall back to a free port."""
     token = os.environ.get("T5250_VIEWER_TOKEN") or secrets.token_urlsafe(18)
     page = resources.files("tn5250_mcp").joinpath("viewer.html").read_text("utf-8")
+    # an open tab reloads itself when the server's page differs from what it runs
+    version = hashlib.sha256(page.encode()).hexdigest()[:12]
+    page = page.replace("__VIEWER_VERSION__", version)
     allowed_hosts: set[str] = set()
 
     class H(BaseHTTPRequestHandler):
@@ -89,14 +94,16 @@ def start_viewer(mgr: Manager, port: int) -> str:
                 name = parse_qs(u.query).get("session", [""])[0]
                 names = list(mgr.sessions)
                 if not names:
-                    return self._json({"sessions": [], "screen": None})
+                    return self._json({"sessions": [], "screen": None, "v": version})
                 s = mgr.sessions.get(name) or mgr.sessions[names[0]]
+                mgr.viewer_seen[s.name] = time.monotonic()
                 with s.cond:
                     snap = s.snapshot()
                     snap["cells"] = _cells(s)
                 for f in snap["fields"]:
                     f["value"] = "" if f["hidden"] else f["value"]
-                self._json({"sessions": names, "screen": snap})
+                self._json({"sessions": names, "screen": snap,
+                            "prompt": mgr.open_prompt(s.name), "v": version})
             else:
                 self.send_error(404)
 
@@ -108,7 +115,13 @@ def start_viewer(mgr: Manager, port: int) -> str:
                 n = int(self.headers.get("Content-Length", "0"))
                 req = json.loads(self.rfile.read(n) or b"{}")
                 s = mgr.get(req.get("session", ""))
-                if u.path == "/api/reconnect":
+                if u.path == "/api/secret":
+                    ok = mgr.answer_prompt(s.name, str(req.get("id", "")),
+                                           None if req.get("cancel") else str(req.get("value", "")))
+                    self._json({"ok": ok} if ok else {"ok": False,
+                                                       "error": "that prompt is no longer open"},
+                               200 if ok else 409)
+                elif u.path == "/api/reconnect":
                     if s.connected:
                         return self._json({"ok": True})
                     mgr.connect(s.name, s.host, s.port, s.tls, s.verify_tls, s.device_name,

@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -39,11 +40,12 @@ from .session import ALL_KEYS, FieldError, Session, norm_key
 NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 PARAM_TYPES = {"string", "integer", "number", "boolean", "secret"}
 PARAM_KEYS = {"type", "description", "default", "min_length", "max_length", "pattern",
-              "enum", "upper", "min", "max", "decimals", "true_value", "false_value", "env"}
+              "enum", "upper", "min", "max", "decimals", "true_value", "false_value", "env",
+              "prompt"}
 STEP_KEYS = {"name", "expect", "when", "fill", "cursor", "press", "wait_for", "timeout",
              "check", "capture", "call", "with", "fail"}
 CHECK_KEYS = {"text", "not_text", "regex", "keyboard", "captured"}
-FLOW_KEYS = {"description", "toolset", "read_only", "expose", "params", "steps"}
+FLOW_KEYS = {"description", "toolset", "read_only", "expose", "params", "steps", "pace"}
 _TEMPLATE = re.compile(r"\{\{|\}\}|\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 
@@ -82,13 +84,15 @@ class Param:
     true_value: str = "Y"
     false_value: str = "N"
     env: str | None = None
+    prompt: str | None = None           # secret: label for the viewer prompt
 
     def coerce(self, raw: Any) -> str:
         """Validate a value (from MCP, the CLI or Python) and return the text
         to type. Raises ValueError with a readable message."""
         n = self.name
         if self.type == "secret":
-            raise ValueError("parameter %r is a secret; it is read from $%s" % (n, self.env))
+            raise ValueError("parameter %r is a secret: a person types it in the viewer, or it "
+                             "comes from the environment; it can't be passed in" % n)
         if self.type == "boolean":
             if isinstance(raw, bool):
                 b = raw
@@ -179,6 +183,7 @@ class Flow:
     params: dict[str, Param]
     steps: list[Step]
     source: str
+    pace: float = 0.0
 
     def captures(self, flows: "FlowSet", seen=()) -> set[str]:
         out: set[str] = set()
@@ -188,19 +193,20 @@ class Flow:
                 out.update(flows.flows[st.call].captures(flows, (*seen, self.name)))
         return out
 
-    def secrets(self, flows: "FlowSet", seen=()) -> set[str]:
-        """Env vars this flow (or any flow it calls) reads secrets from."""
-        out = {p.env for p in self.params.values() if p.type == "secret"}
+    def secrets(self, flows: "FlowSet", seen=()) -> list[Param]:
+        """Secret parameters of this flow and of every flow it calls."""
+        out = [p for p in self.params.values() if p.type == "secret"]
         for st in self.steps:
             if st.call and st.call not in seen and st.call in flows.flows:
-                out |= flows.flows[st.call].secrets(flows, (*seen, self.name))
+                out += flows.flows[st.call].secrets(flows, (*seen, self.name))
         return out
 
     def summary(self) -> str:
         ps = []
         for p in self.params.values():
             if p.type == "secret":
-                ps.append("%s (secret from $%s)" % (p.name, p.env))
+                ps.append("%s (secret: viewer prompt%s)" % (
+                    p.name, " or $%s" % p.env if p.env else ""))
             else:
                 ps.append(p.name + ("" if p.required else "=%r" % p.default))
         return "%s(%s)%s%s - %s" % (self.name, ", ".join(ps),
@@ -275,15 +281,18 @@ def _parse_param(name: str, spec: Any, where: str) -> Param:
     p.true_value = str(spec.get("true_value", "Y"))
     p.false_value = str(spec.get("false_value", "N"))
     if t == "secret":
-        if not spec.get("env") or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", str(spec["env"])):
-            raise FlowConfigError("%s: secret parameter %s needs env: VARIABLE_NAME"
-                                  % (where, name))
-        p.env = str(spec["env"])
+        if "env" in spec:
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", str(spec["env"])):
+                raise FlowConfigError("%s: secret parameter %s: env must be a variable name"
+                                      % (where, name))
+            p.env = str(spec["env"])
+        p.prompt = str(spec.get("prompt") or p.description or name.replace("_", " ").capitalize())
         if "default" in spec:
             raise FlowConfigError("%s: secret parameter %s can't have a default"
                                   % (where, name))
-    elif "env" in spec:
-        raise FlowConfigError("%s: parameter %s: env is only for type: secret" % (where, name))
+    elif "env" in spec or "prompt" in spec:
+        raise FlowConfigError("%s: parameter %s: env and prompt are only for type: secret"
+                              % (where, name))
     if "default" in spec:
         p.required = False
         p.default = spec["default"]
@@ -452,11 +461,14 @@ class FlowSet:
             if not isinstance(steps_spec, list) or not steps_spec:
                 raise FlowConfigError("%s: needs a list of steps" % where)
             steps = [_parse_step(i, s, where) for i, s in enumerate(steps_spec, 1)]
+            pace = spec.get("pace", 0)
+            if not isinstance(pace, (int, float)) or isinstance(pace, bool) or not 0 <= pace <= 10:
+                raise FlowConfigError("%s: pace is seconds between steps (0-10)" % where)
             self.flows[name] = Flow(
                 name=name, description=str(spec["description"]).strip(),
                 toolset=spec.get("toolset", default_ts), read_only=bool(spec.get("read_only")),
                 expose=bool(spec.get("expose", True)), params=params, steps=steps,
-                source=source)
+                source=source, pace=float(pace))
 
     def validate(self) -> None:
         """Cross-flow checks: calls resolve, no cycles, templates name known
@@ -485,6 +497,11 @@ class FlowSet:
                     callee = self.flows.get(st.call)
                     if not callee:
                         raise FlowConfigError("%s: calls unknown flow %r" % (w, st.call))
+                    passed = sorted(n for n in st.call_with
+                                    if n in callee.params and callee.params[n].type == "secret")
+                    if passed:
+                        raise FlowConfigError("%s: %s is a secret of %s and can't be passed in"
+                                              % (w, ", ".join(passed), st.call))
                     extra = set(st.call_with) - set(callee.params)
                     if extra:
                         raise FlowConfigError("%s: %s has no parameter %s"
@@ -507,11 +524,13 @@ class FlowSet:
             if st.call:
                 self._no_cycle(st.call, [*stack, name])
 
-    def select(self, toolsets: list[str] | None = None, read_only: bool = False) -> list[Flow]:
-        """Flows to expose as tools: exposed, no secrets, in the toolsets."""
+    def select(self, toolsets: list[str] | None = None, read_only: bool = False,
+               allow_secrets: bool = False) -> list[Flow]:
+        """Flows to expose as tools: exposed, in the toolsets. Flows that need a
+        secret only when a person can type it (allow_secrets: the viewer runs)."""
         out = []
         for f in self.flows.values():
-            if not f.expose or f.secrets(self):
+            if not f.expose or (f.secrets(self) and not allow_secrets):
                 continue
             if toolsets and f.toolset not in toolsets:
                 continue
@@ -536,9 +555,19 @@ class FlowResult:
 
 
 class FlowRunner:
+    """Runs flows on a session.
+
+    Secrets: when somebody is watching the session in the viewer, the person
+    is asked there (the value never reaches the caller or the log). Otherwise
+    the parameter's env variable is used. `pace` waits that many seconds after
+    each step so a person can follow along (a flow's own `pace` can be longer).
+    """
+
     def __init__(self, mgr: Manager, flows: FlowSet,
-                 env: Callable[[str], str | None] = os.environ.get):
+                 env: Callable[[str], str | None] = os.environ.get, pace: float = 0.0,
+                 prompt_timeout: float = 120.0):
         self.mgr, self.flows, self.env = mgr, flows, env
+        self.pace, self.prompt_timeout = pace, prompt_timeout
 
     def run(self, s: Session, name: str, params: dict[str, Any]) -> FlowResult:
         flow = self.flows.flows.get(name)
@@ -588,20 +617,40 @@ class FlowRunner:
                 raise FlowError("refused before starting: %s (in %s)"
                                 % (e, " > ".join((*stack, flow.name, "step " + st.label))))
 
+    def secret(self, s: Session | None, flow: Flow, p: Param) -> str:
+        if s is not None and self.mgr.viewer_url and self.mgr.viewer_watching(s.name):
+            try:
+                return self.mgr.ask_secret(s.name, p.prompt or p.name, self.prompt_timeout)
+            except GuardError as e:
+                raise FlowError("%s: %s" % (flow.name, e)) from None
+        v = self.env(p.env) if p.env else None
+        if v:
+            return v
+        if self.mgr.viewer_url:
+            raise FlowError("%s needs %s, typed by a person: give the user the viewer link (%s), "
+                            "ask them to keep it open, then run the flow again"
+                            % (flow.name, p.prompt or p.name, self.mgr.viewer_url))
+        raise FlowError("%s needs the secret %s: %s" % (
+            flow.name, p.name, "set $%s" % p.env if p.env else "open the viewer to type it"))
+
     def bind(self, flow: Flow, params: dict[str, Any], secrets: list[str],
-             with_secrets: bool = True) -> dict[str, str]:
+             with_secrets: bool = True, s: Session | None = None) -> dict[str, str]:
         extra = set(params) - set(flow.params)
         if extra:
             raise FlowError("%s has no parameter %s (parameters: %s)" % (
-                flow.name, ", ".join(sorted(extra)), ", ".join(flow.params) or "none"))
+                flow.name, ", ".join(sorted(extra)), ", ".join(
+                    n for n, p in flow.params.items() if p.type != "secret") or "none"))
+        passed = sorted(n for n in params if flow.params[n].type == "secret")
+        if passed:
+            raise FlowError("%s: %s is a secret; a person types it in the viewer (or it comes "
+                            "from the environment), it can't be passed in"
+                            % (flow.name, ", ".join(passed)))
         out: dict[str, str] = {}
         for n, p in flow.params.items():
             if p.type == "secret":
                 if not with_secrets:
                     continue
-                v = self.env(p.env or "")
-                if not v:
-                    raise FlowError("%s needs the secret %s: set $%s" % (flow.name, n, p.env))
+                v = self.secret(s, flow, p)
                 secrets.append(v)
                 out[n] = v
                 continue
@@ -619,8 +668,9 @@ class FlowRunner:
 
     def _run(self, s: Session, flow: Flow, params: dict[str, Any], log: list[str],
              secrets: list[str], depth: int) -> dict[str, str]:
-        vals = self.bind(flow, params, secrets)
+        vals = self.bind(flow, params, secrets, s=s)
         ind = "  " * depth
+        pace = max(self.pace, flow.pace)
         s.log("flow", "%s%s %r" % (ind, flow.name, self._mask(repr(
             {k: v for k, v in vals.items()}), secrets)))
         s.wait(timeout=10)
@@ -677,6 +727,8 @@ class FlowRunner:
             log.append("%s%s/%s: %s" % (ind, flow.name, st.label,
                                         ("pressed " + st.press) if st.press else
                                         "filled" if values else "checked"))
+            if pace and (st.press or values or st.cursor):
+                time.sleep(pace)
         return vals
 
     def _check(self, s: Session, st: Step, vals: dict[str, str], fail) -> None:

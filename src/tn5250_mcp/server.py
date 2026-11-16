@@ -36,7 +36,11 @@ Workflow: connect -> get_screen -> fill / press -> read the screen that press re
   keyboard BUSY means the host is still working: call wait.
 - Other tools may be screen flows defined by the user (whole procedures such as
   "add an order"). When one fits the task, use it instead of fill/press: it
-  checks every screen on the way and validates its parameters.
+  checks every screen on the way and validates its parameters. A flow that
+  needs a password (e.g. a sign-on flow) asks the user for it in the viewer;
+  give them the viewer link first.
+- press refuses keys a real terminal would refuse (mandatory entry, mandatory
+  fill, wrong check digit) and says which field to fix; nothing is sent then.
 """
 
 BUILTIN_TOOLS = {"connect", "disconnect", "list_sessions", "get_screen", "fill", "press",
@@ -85,16 +89,19 @@ def _start_screen(f: Flow, flows: FlowSet) -> list[str]:
 
 def _flow_description(f: Flow, flows: FlowSet) -> str:
     start = _start_screen(f, flows)
-    return "%s\n\n(screen flow%s%s)" % (
+    secret = sorted({p.prompt or p.name for p in f.secrets(flows)})
+    return "%s\n\n(screen flow%s%s)%s" % (
         f.description, "; starts on a screen showing %s" % " + ".join(map(repr, start))
-        if start else "", "; read-only" if f.read_only else "")
+        if start else "", "; read-only" if f.read_only else "",
+        ("\nNeeds %s, which the user types in the viewer: give them the viewer link and ask "
+         "them to keep it open before you run this." % " and ".join(secret)) if secret else "")
 
 
 def build_server(mgr: Manager, flows: FlowSet | None = None,
                  toolsets: list[str] | None = None, flows_only: bool = False,
-                 read_only: bool = False) -> MCPServer:
-    mcp = MCPServer("tn5250", instructions=INSTRUCTIONS, version="0.2.0")
-    runner = FlowRunner(mgr, flows) if flows else None
+                 read_only: bool = False, pace: float = 0.0) -> MCPServer:
+    mcp = MCPServer("tn5250", instructions=INSTRUCTIONS, version="0.3.0")
+    runner = FlowRunner(mgr, flows, pace=pace) if flows else None
 
     async def run(fn, *a, **k):
         try:
@@ -228,7 +235,7 @@ def build_server(mgr: Manager, flows: FlowSet | None = None,
         return ", ".join(ALL_KEYS)
 
     if flows:
-        for f in flows.select(toolsets, read_only):
+        for f in flows.select(toolsets, read_only, allow_secrets=bool(mgr.viewer_url)):
             _add_flow_tool(mcp, f, flows, runner, run)
     return mcp
 
@@ -248,7 +255,7 @@ def _add_flow_tool(mcp: MCPServer, f: Flow, flows: FlowSet, runner: FlowRunner,
     params = [inspect.Parameter(p.name, inspect.Parameter.KEYWORD_ONLY,
                                 annotation=_flow_annotation(p),
                                 default=inspect.Parameter.empty if p.required else p.default)
-              for p in f.params.values()]
+              for p in f.params.values() if p.type != "secret"]
     params.append(inspect.Parameter("session", inspect.Parameter.KEYWORD_ONLY,
                                     annotation=Session_, default="main"))
     tool.__signature__ = inspect.Signature(params, return_annotation=str)
@@ -293,6 +300,8 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--flows-only", action="store_true",
                    default=os.environ.get("T5250_FLOWS_ONLY") == "1",
                    help="no fill/press tools: the agent can only read screens and run flows")
+    p.add_argument("--pace", type=float, default=float(os.environ.get("T5250_PACE", "0")),
+                   help="seconds to wait after each flow step, so a person can follow")
     p.add_argument("--read-only", action="store_true",
                    default=os.environ.get("T5250_READ_ONLY") == "1",
                    help="no fill/press, and only flows marked read_only")
@@ -318,11 +327,12 @@ def main(argv: list[str] | None = None) -> None:
 
     toolsets = [t.strip() for t in a.toolsets.split(",") if t.strip()] or None
     try:
-        server = build_server(mgr, flowset, toolsets, a.flows_only, a.read_only)
+        server = build_server(mgr, flowset, toolsets, a.flows_only, a.read_only, a.pace)
     except FlowConfigError as e:
         p.exit(2, "tn5250-mcp: %s\n" % e)
     if flowset:
-        offered = [f.name for f in flowset.select(toolsets, a.read_only)]
+        offered = [f.name for f in flowset.select(toolsets, a.read_only,
+                                                   allow_secrets=bool(mgr.viewer_url))]
         print("tn5250-mcp: flow tools: %s" % (", ".join(offered) or "none"), file=sys.stderr)
     if a.transport == "stdio":
         server.run("stdio")

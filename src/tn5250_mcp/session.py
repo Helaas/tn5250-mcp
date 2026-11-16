@@ -13,7 +13,7 @@ import time
 from dataclasses import dataclass
 
 from . import telnet as T
-from .screen import (ADJUST_RIGHT_BLANK, ADJUST_RIGHT_ZERO, FFW_MDT, Codepage, Field,
+from .screen import (ADJUST_MANDATORY_FILL, ADJUST_RIGHT_BLANK, ADJUST_RIGHT_ZERO, FFW_MDT, Codepage, Field,
                      ScreenBuffer, describe_attr)
 
 ESC = 0x04
@@ -43,6 +43,32 @@ for _i in range(13, 25):
     AID["f%d" % _i] = 0xB0 + (_i - 12)
 SPECIAL_KEYS = {"sysreq", "attn", "reset"}
 ALL_KEYS = sorted(set(AID) | SPECIAL_KEYS)
+
+# AIDs a real terminal sends without its own field checks: Clear, Help,
+# Print and the roll keys (5494 functions reference; matches ACS).
+NO_CHECK_AIDS = {0xBD, 0xF3, 0xF6, 0xF4, 0xF5}
+FCW_SELF_CHECK_MOD10 = 0xB140
+FCW_SELF_CHECK_MOD11 = 0xB1A0
+
+
+def mod10_ok(digits: str) -> bool:
+    """IBM modulus 10 self-check: weights 2,1,2,1... from the right, not
+    counting the check digit; digits of the products are added."""
+    body, check = digits[:-1], int(digits[-1])
+    total = 0
+    for k, ch in enumerate(reversed(body)):
+        prod = int(ch) * (2 if k % 2 == 0 else 1)
+        total += prod // 10 + prod % 10
+    return (10 - total % 10) % 10 == check
+
+
+def mod11_ok(digits: str) -> bool:
+    """IBM modulus 11 self-check: weights 2..7 repeating from the right."""
+    body, check = digits[:-1], int(digits[-1])
+    total = sum(int(ch) * (2 + k % 6) for k, ch in enumerate(reversed(body)))
+    r = total % 11
+    want = 0 if r == 0 else 11 - r
+    return want != 10 and want == check
 
 SAVE_MAGIC = b"\x04\x11\x00\x00\x10\x00\x06T5"   # opaque to the host
 
@@ -605,9 +631,14 @@ class Session:
             fill = 0xF0 if f0.adjust == ADJUST_RIGHT_ZERO else 0x40
             return digits.rjust(total - 1, bytes([fill])) + (b"\x60" if neg else b"\x00")
         if shift == "numeric_only" and not re.fullmatch(r"[0-9+\-,. ]*", value):
-            raise FieldError("field %d,%d accepts numbers only" % self.buf.rowcol(f0.start))
+            raise FieldError("field %d,%d accepts numbers only (operator error 0009)"
+                             % self.buf.rowcol(f0.start))
         if shift == "digits_only" and not value.isdigit():
-            raise FieldError("field %d,%d accepts digits only" % self.buf.rowcol(f0.start))
+            raise FieldError("field %d,%d accepts digits only (operator error 0010)"
+                             % self.buf.rowcol(f0.start))
+        if shift == "alpha_only" and not all(ch.isalpha() or ch in ",.- " for ch in value):
+            raise FieldError("field %d,%d accepts letters, comma, period, dash and blank only "
+                             "(operator error 0008)" % self.buf.rowcol(f0.start))
         enc = self.cp.encode(value)
         if len(enc) > total:
             raise FieldError("value is %d characters; field %d,%d holds %d"
@@ -679,8 +710,47 @@ class Session:
                                     "and read the message line")
             if not self.ready():
                 raise ProtocolError("host is busy (keyboard locked); call wait first")
+            self._check_fields(AID[k])
             self._send_fields(AID[k])
             self.cond.notify_all()
+
+    def _check_fields(self, aid: int) -> None:
+        """The checks a real 5250 terminal makes before it sends an AID with
+        field data: mandatory entry, mandatory fill and self-check digits.
+        On a violation nothing is sent, the cursor goes to the field and
+        FieldError says what to fix (with the standard operator error code)."""
+        b = self.buf
+        if aid in NO_CHECK_AIDS or not b.send_data_for_aid(aid):
+            return
+        for g in b.input_fields():
+            f0 = g[0]
+            modified = any(f.modified for f in g)
+            raw = b"".join(bytes(b.data[f.start:f.start + f.length]) for f in g)
+            r, c = b.rowcol(f0.start)
+            problem = None
+            if f0.mandatory_entry and not modified:
+                problem = ("field %d,%d must be filled in before %s (mandatory entry, "
+                           "operator error 0007)")
+            elif f0.adjust == ADJUST_MANDATORY_FILL and modified:
+                used = raw.rstrip(b"\x00\x40")
+                if used and len(used) < len(raw):
+                    problem = ("field %d,%d must be filled to its full length of " + str(len(raw))
+                               + " or left empty before %s (mandatory fill, operator error 0014)")
+            if problem is None and modified and (FCW_SELF_CHECK_MOD10 in f0.fcw
+                                                 or FCW_SELF_CHECK_MOD11 in f0.fcw):
+                text = b.field_text(g, self.cp).strip()
+                if text:
+                    ok = text.isdigit() and len(text) > 1 and (
+                        mod10_ok(text) if FCW_SELF_CHECK_MOD10 in f0.fcw else mod11_ok(text))
+                    if not ok:
+                        problem = ("field %d,%d: the check digit of " + repr(text)
+                                   + " is wrong; nothing was sent with %s (self-check, "
+                                   "operator error 0015)")
+            if problem:
+                b.user_cursor = f0.start
+                name = next((n for n, v in AID.items() if v == aid), "the key")
+                raise FieldError(problem % (r, c, name.capitalize() if len(name) > 3
+                                            else name.upper()))
 
     def _row_segments(self, group: list[Field]) -> list[dict]:
         """Split a logical field into on-screen pieces, one per row (a long

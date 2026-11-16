@@ -22,6 +22,7 @@ mandatory and hidden fields, and the exact keyboard state.
 | Password fields | invisible | listed as hidden, contents never shown to the agent |
 | "Is the host done?" | wait for the screen to stop changing | exact: the host's read command + keyboard unlock |
 | Wrong-screen typing | possible | refused (`expect` / `screen_id` checks) |
+| Mandatory / must-fill / check-digit fields | the host complains afterwards | refused before sending, like a real terminal |
 | Destructive commands | nothing stops them | configurable block list |
 | Repeatable procedures | prompt the agent again | YAML screen flows, run as tools or tests |
 
@@ -114,7 +115,8 @@ tn5250-run check flows/                    # validate and list
 **Parameters** (`params`): `type` is `string` (`min_length`, `max_length`,
 `pattern`, `enum`, `upper`), `integer` or `number` (`min`, `max`, `decimals`),
 `boolean` (typed as `true_value`/`false_value`, default `Y`/`N`) or `secret`
-(`env: VAR`; see below). Add `default` to make a parameter optional, and
+(a password; optional `prompt` label and `env: VAR`; see "Passwords" below).
+Add `default` to make a parameter optional, and
 `description` for the agent. Values are checked before anything is typed:
 for this flow, for every flow it calls, and against the block list. A flow is
 refused as a whole; it doesn't stop half-way because of a bad value.
@@ -138,13 +140,15 @@ refused as a whole; it doesn't stop half-way because of a bad value.
 `{name}` inserts a parameter or capture. In regexes the value matches
 literally. Flow options: `description` (required), `toolset`, `read_only`
 (your promise that the flow only displays things; such a flow may only call
-other read-only flows), `expose: false` (a helper for other flows, not a tool).
+other read-only flows), `expose: false` (a helper for other flows, not a tool),
+`pace` (seconds to wait after each step so a person can follow in the viewer;
+`--pace` sets it for all flows).
 
 A failing flow reports the flow, the step and the screen at that moment. Over
 MCP, a flow returns its step log, its captures and the final screen.
 
-See [`examples/flows/`](examples/flows/): `ibmi.yaml` (`run_command`, a
-read-only `sql_select`) and `dfu_demo.yaml` (data entry through UPDDTA, plus
+See [`examples/flows/`](examples/flows/): `ibmi.yaml` (`signon`, `run_command`,
+a read-only `sql_select`) and `dfu_demo.yaml` (data entry through UPDDTA, plus
 `data_entry_test`, the end-to-end test).
 
 ## Scripts, CI and pytest
@@ -193,10 +197,23 @@ pass `--t5250-viewer-port 0` to sign on by hand in the viewer. A failing
 test's report includes the 5250 screen. `--t5250-log-dir` keeps transcripts as
 test evidence.
 
-**Passwords:** `secret` parameters and `signon()` read the environment, so
-credentials come from your CI's secret store, never from the agent. Flows with
-secrets are never offered over MCP, and their values are masked in logs and
-results. Over MCP, a person signs on in the viewer.
+### Passwords
+
+A `secret` parameter is never passed in by the caller. When the flow runs:
+
+1. If somebody is watching the session in the viewer, a password dialog opens
+   there and the person types it. The dialog keeps password managers out and
+   only sends what was actually typed or pasted, because an auto-filled stale
+   password counts as a failed sign-on (and enough of those disable the user
+   profile).
+2. Otherwise the parameter's `env` variable is used (CI secrets).
+3. Otherwise the flow stops before anything is typed and tells the agent to
+   hand the user the viewer link.
+
+The value goes to the host only: it is masked in transcripts, results and
+errors, and never reaches the agent. Flows with secrets are offered over MCP
+only when the viewer is running, without the secret in their parameters. So an
+agent can run `signon`, and you type the password in the viewer.
 
 ## Safety rails
 
@@ -214,7 +231,16 @@ results. Over MCP, a person signs on in the viewer.
   the agent can read screens and run your flows, nothing else. `--read-only`
   also drops every flow not marked `read_only`.
 - **Passwords stay with people.** Hidden (non-display) fields are never shown
-  to the agent. Sign on in the viewer; the agent carries on from there.
+  to the agent. Sign on in the viewer, or let a sign-on flow ask for the
+  password in the viewer; the agent carries on from there.
+- **Terminal-side field checks.** Like a real 5250 terminal, `press` (and the
+  viewer) refuse to send when a mandatory-entry field is empty (operator error
+  0007), a mandatory-fill field is only partly filled (0014) or a self-check
+  field has a wrong modulus 10/11 check digit (0015). Alphabetic-only (0008),
+  numeric-only (0009) and digits-only (0010) fields reject other characters.
+  Nothing is sent, the cursor goes to the field, and the error says what to
+  fix. Help, Clear, Print and the roll keys are exempt, as are keys whose field
+  data the screen doesn't send.
 - **Per-tool permissions.** Read tools are marked read-only and `press` is
   marked destructive, so MCP clients can auto-approve reading and still ask
   before keys are sent.
@@ -224,7 +250,9 @@ results. Over MCP, a person signs on in the viewer.
 ## The viewer
 
 A local page (`http://127.0.0.1:8251/?token=…`, link from the `viewer` tool)
-that shows the session live in colour with real input fields. Type, press Enter
+that shows the session live in colour with real input fields. It also shows
+the password dialog when a flow needs a secret, and reloads itself when the
+server has a newer version of the page. Type, press Enter
 or F-keys (Shift+F1-F12 = F13-F24), PageUp/PageDown, Esc = Reset. It only
 listens on 127.0.0.1 and needs the random token, and it checks the Host header.
 `--viewer-port 0` turns it off.
@@ -247,6 +275,7 @@ listens on 127.0.0.1 and needs the random token, and it checks the Host header.
 | `--toolsets a,b` | `T5250_TOOLSETS` | all |
 | `--flows-only` | `T5250_FLOWS_ONLY=1` | off |
 | `--read-only` | `T5250_READ_ONLY=1` | off |
+| `--pace SECONDS` | `T5250_PACE` | `0` (no wait between flow steps) |
 
 ## Examples and tests
 

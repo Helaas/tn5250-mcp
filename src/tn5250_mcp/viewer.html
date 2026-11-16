@@ -40,6 +40,15 @@
   #msg { margin-top:10px; color:var(--red); min-height:1.4em; }
   #empty { color:var(--muted); padding:40px 16px; }
   .help { color:var(--muted); font-size:12px; margin-top:8px; }
+  dialog { background:var(--panel); color:var(--text); border:1px solid var(--accent);
+           border-radius:10px; padding:18px 20px; width:min(420px, calc(100vw - 32px)); }
+  dialog::backdrop { background:rgba(0,0,0,.6); }
+  dialog h2 { font-size:15px; margin:0 0 6px; }
+  dialog p { color:var(--muted); font-size:12px; margin:0 0 12px; }
+  dialog input { width:100%; font:inherit; color:var(--text); background:#000;
+                 border:1px solid var(--line); border-radius:6px; padding:6px 8px; }
+  dialog .row2 { display:flex; gap:8px; justify-content:flex-end; margin-top:14px; }
+  dialog .primary { background:var(--accent); color:#0b0d0c; border-color:var(--accent); }
 </style>
 </head>
 <body>
@@ -59,10 +68,27 @@
     PageUp/PageDown to roll, Esc = Reset. Passwords you type here go straight to the host;
     Claude is never shown hidden fields.</div>
 </main>
+<dialog id="pw" aria-labelledby="pwTitle">
+  <form id="pwForm" method="dialog">
+    <h2 id="pwTitle">Password</h2>
+    <p>A screen flow needs this to continue. It goes straight to the host; Claude never sees it
+      and it is not logged.</p>
+    <!-- password managers stay out: a wrong auto-filled password counts as a failed
+         sign-on on the host, and too many disable the user profile -->
+    <input id="pwValue" type="password" name="t5250-prompt" autocomplete="off" required
+           data-1p-ignore data-lpignore="true" data-bwignore data-form-type="other">
+    <p id="pwHint" hidden></p>
+    <div class="row2">
+      <button type="button" id="pwCancel">Cancel</button>
+      <button type="submit" class="primary">Send</button>
+    </div>
+  </form>
+</dialog>
 <script>
 const token = new URLSearchParams(location.search).get("token") || "";
+const VERSION = "__VIEWER_VERSION__";
 const $ = (id) => document.getElementById(id);
-let current = null, lastId = null, dirty = {}, busy = false;
+let current = null, lastId = null, dirty = {}, busy = false, promptId = null, pwTyped = false;
 const colors = {green:"var(--green)", white:"var(--white)", red:"var(--red)", turquoise:"var(--turquoise)",
                 yellow:"var(--yellow)", pink:"var(--pink)", blue:"var(--blue)", none:"transparent"};
 
@@ -117,6 +143,7 @@ function render(s) {
       }
     });
   }
+  if (promptId) return;                       // the password dialog keeps the focus
   if (focusEl) { focusEl[0].focus(); try { focusEl[0].setSelectionRange(focusEl[1], focusEl[1]); } catch (e) {} }
   else { const first = scr.querySelector("input"); if (first) first.focus(); }
 }
@@ -180,6 +207,7 @@ async function poll(force) {
   let st;
   try { st = await api("/api/state?session=" + encodeURIComponent($("sess").value || "")); }
   catch (e) { $("kb").textContent = "viewer offline"; $("kb").className = "pill disconnected"; return; }
+  if (st.v && st.v !== VERSION) { location.reload(); return; }   // server has a newer page
   const sel = $("sess");
   const names = st.sessions;
   if (sel.options.length !== names.length || [...sel.options].some((o, i) => o.value !== names[i])) {
@@ -187,6 +215,7 @@ async function poll(force) {
     for (const n of names) { const o = document.createElement("option"); o.value = o.textContent = n; sel.appendChild(o); }
     if (names.includes(keep)) sel.value = keep;
   }
+  syncPrompt(st.prompt);
   const s = st.screen;
   $("empty").hidden = !!s; $("scr").hidden = !s; $("keys").hidden = !s; $("help").hidden = !s;
   if (!s) { $("kb").textContent = "-"; $("kb").className = "pill"; return; }
@@ -201,6 +230,48 @@ async function poll(force) {
     current = s; lastId = key; render(s);
   }
 }
+function syncPrompt(p) {
+  const dlg = $("pw");
+  if (p && p.id !== promptId) {
+    promptId = p.id;
+    $("pwTitle").textContent = p.label;
+    $("pwValue").value = ""; pwTyped = false; $("pwHint").hidden = true;
+    if (!dlg.open) dlg.showModal();
+    $("pwValue").focus();
+  } else if (!p && promptId) {
+    promptId = null;
+    if (dlg.open) dlg.close();
+  }
+}
+async function answerPrompt(cancel) {
+  const id = promptId, value = $("pwValue").value;
+  $("pwValue").value = "";
+  promptId = null; $("pw").close();
+  if (!id || !current) return;
+  const r = await api("/api/secret", cancel ? {session: current.session, id, cancel: true}
+                                             : {session: current.session, id, value});
+  if (!r.ok) $("msg").textContent = r.error;
+}
+// Only send what a person typed or pasted: auto-filled values (no real key presses) are
+// refused, so a password manager can't submit a stale password on its own.
+// Typing, pasting and input methods (also on phones) send trusted "beforeinput" events;
+// auto-fill sets the value directly or reports "insertReplacementText".
+$("pwValue").addEventListener("beforeinput", (e) => {
+  if (e.isTrusted && /^insert/.test(e.inputType) && e.inputType !== "insertReplacementText") pwTyped = true;
+});
+$("pwValue").addEventListener("paste", (e) => { if (e.isTrusted) pwTyped = true; });
+$("pwForm").addEventListener("submit", (e) => {
+  e.preventDefault();
+  if (!pwTyped) {
+    $("pwValue").value = "";
+    $("pwHint").textContent = "Please type or paste the password yourself; auto-filled values are not sent.";
+    $("pwHint").hidden = false; $("pwValue").focus();
+    return;
+  }
+  answerPrompt(false);
+});
+$("pwCancel").addEventListener("click", () => answerPrompt(true));
+$("pw").addEventListener("cancel", (e) => { e.preventDefault(); answerPrompt(true); });
 $("sess").addEventListener("change", () => poll(true));
 $("reconnect").addEventListener("click", async () => {
   if (!current) return;

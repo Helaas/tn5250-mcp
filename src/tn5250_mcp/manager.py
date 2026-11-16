@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import os
+import secrets as _secrets
 import threading
 import time
 
@@ -77,6 +78,46 @@ class Manager:
         self.sessions: dict[str, Session] = {}
         self.lock = threading.Lock()
         self.viewer_url: str | None = None
+        self.viewer_seen: dict[str, float] = {}     # session -> last viewer poll
+        self.prompts: dict[str, dict] = {}          # session -> open secret prompt
+
+    # -- secrets typed by a person in the viewer -----------------------------
+    def viewer_watching(self, name: str, within: float = 3.0) -> bool:
+        """Is somebody looking at this session in the viewer right now?"""
+        return time.monotonic() - self.viewer_seen.get(name, -1e9) < within
+
+    def ask_secret(self, name: str, label: str, timeout: float = 120.0) -> str:
+        """Show a password prompt in the viewer for this session and wait for
+        the person to answer. The value never reaches the agent or the log."""
+        p = {"id": _secrets.token_hex(6), "label": label, "value": None,
+             "cancelled": False, "event": threading.Event()}
+        with self.lock:
+            if name in self.prompts:
+                raise GuardError("a password prompt is already open in the viewer")
+            self.prompts[name] = p
+        try:
+            if not p["event"].wait(timeout):
+                raise GuardError("nobody entered %s in the viewer within %ds" % (label, timeout))
+            if p["cancelled"] or not p["value"]:
+                raise GuardError("%s was not entered (cancelled in the viewer)" % label)
+            return p["value"]
+        finally:
+            with self.lock:
+                if self.prompts.get(name) is p:
+                    del self.prompts[name]
+
+    def open_prompt(self, name: str) -> dict | None:
+        p = self.prompts.get(name)
+        return {"id": p["id"], "label": p["label"]} if p else None
+
+    def answer_prompt(self, name: str, pid: str, value: str | None) -> bool:
+        with self.lock:
+            p = self.prompts.get(name)
+            if not p or p["id"] != pid:
+                return False
+            p["value"], p["cancelled"] = value, value is None
+            p["event"].set()
+            return True
 
     # -- logging -------------------------------------------------------------
     def _logger(self, name: str):

@@ -1,7 +1,34 @@
-# General IBM i flows. All of them start and end on the IBM i Main Menu.
+# General IBM i flows. signon starts on the sign-on screen; the others start and
+# end on the IBM i Main Menu.
 
 toolset: ibmi
 flows:
+  signon:
+    description: >-
+      Sign on at the sign-on screen as the given user. The user types the
+      password in the viewer (or it comes from $T5250_PASSWORD when nobody is
+      watching). Ends on the first screen after sign-on, usually a menu.
+    params:
+      user: {type: string, upper: true, pattern: '^[A-Z$#@][A-Z0-9$#@_]{0,9}$',
+             description: "user profile"}
+      password: {type: secret, env: T5250_PASSWORD, prompt: "IBM i password"}
+    steps:
+      - name: sign on
+        expect: "Password"                    # works for custom sign-on screens too
+        fill: {User: "{user}", Password: "{password}"}
+        press: Enter
+        timeout: 60
+        check: {keyboard: any}
+      - name: refused
+        when: "Password"
+        fail: "sign-on was refused; the sign-on screen is still showing (see its message line)"
+      - name: program messages
+        when: "Display Program Messages"
+        press: Enter
+      - name: press enter to continue
+        when: "Press Enter to continue"
+        press: Enter
+
   run_command:
     description: >-
       Run a CL command from the IBM i Main Menu command line, for commands that
