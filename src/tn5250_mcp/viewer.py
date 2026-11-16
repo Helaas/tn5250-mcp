@@ -41,9 +41,11 @@ def _cells(s) -> list[list[list]]:
 
 
 def start_viewer(mgr: Manager, port: int) -> str:
+    """Serve the viewer on 127.0.0.1:port. If that port is taken (another
+    stdio server from a second MCP client, say), fall back to a free port."""
     token = os.environ.get("T5250_VIEWER_TOKEN") or secrets.token_urlsafe(18)
     page = resources.files("tn5250_mcp").joinpath("viewer.html").read_text("utf-8")
-    allowed_hosts = {"127.0.0.1:%d" % port, "localhost:%d" % port}
+    allowed_hosts: set[str] = set()
 
     class H(BaseHTTPRequestHandler):
         def log_message(self, *a):   # keep stdio clean for MCP
@@ -125,6 +127,11 @@ def start_viewer(mgr: Manager, port: int) -> str:
             except (KeyError, ValueError) as e:
                 self._json({"ok": False, "error": "bad request: %s" % e}, 400)
 
-    srv = ThreadingHTTPServer(("127.0.0.1", port), H)
+    try:
+        srv = ThreadingHTTPServer(("127.0.0.1", port), H)
+    except OSError:
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+    port = srv.server_address[1]
+    allowed_hosts.update({"127.0.0.1:%d" % port, "localhost:%d" % port})
     threading.Thread(target=srv.serve_forever, name="5250-viewer", daemon=True).start()
     return "http://127.0.0.1:%d/?token=%s" % (port, token)

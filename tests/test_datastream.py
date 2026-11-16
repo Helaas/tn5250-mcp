@@ -196,3 +196,19 @@ def test_label_from_heading_above():
     f = s.snapshot()["fields"][0]
     assert f["label"] == "Selection or command"
     assert [(g["row"], g["col"], g["length"]) for g in f["segments"]] == [(20, 7, 74), (21, 1, 79)]
+
+
+def test_viewer_falls_back_when_port_taken():
+    import socket
+    import urllib.request
+    from tn5250_mcp.viewer import start_viewer
+    busy = socket.socket()
+    busy.bind(("127.0.0.1", 0))
+    busy.listen()
+    taken = busy.getsockname()[1]
+    url = start_viewer(Manager(Guard()), taken)
+    port = int(url.split(":")[2].split("/")[0])
+    assert port != taken
+    with urllib.request.urlopen(url) as r:          # Host header matches the new port
+        assert r.status == 200
+    busy.close()

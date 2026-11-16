@@ -107,7 +107,7 @@ listens on 127.0.0.1 and needs the random token, and it checks the Host header.
 |---|---|---|
 | `--transport stdio\|http` | `T5250_TRANSPORT` | `stdio` |
 | `--port` | `T5250_PORT` | `8250` (HTTP transport, path `/mcp`) |
-| `--viewer-port` | `T5250_VIEWER_PORT` | `8251`, `0` = off |
+| `--viewer-port` | `T5250_VIEWER_PORT` | `8251` (a free port if taken), `0` = off |
 | `--allowed-hosts` | `T5250_ALLOWED_HOSTS` | any |
 | `--block REGEX` (repeatable) | `T5250_BLOCK` (comma list) | none extra |
 | `--no-default-blocks` | `T5250_NO_DEFAULT_BLOCKS=1` | defaults on |
