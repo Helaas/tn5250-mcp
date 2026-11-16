@@ -94,6 +94,8 @@ claude mcp add --transport http tn5250 http://127.0.0.1:8250/mcp
 | `pase` | run a PASE shell command (git, make, python3, `system`), get exit code, stdout, stderr (only with `--allow-shell`) |
 | `source_members`, `member_read` | list source files and members, read a member |
 | `member_write` | replace or create a source member (only in `--allow-member-write` libraries) |
+| `describe` | what an object looks like: a file's fields (RPG types) and keys, a display file's fields, a program's modules and sources, a service program's exports |
+| `explain_message` | a message's text, cause and recovery (compile, run-time, CL, SQL messages) |
 | `job_log` | a job's messages: why a command, compile or batch job failed |
 | `spooled_files`, `spooled_file` | list and read printed output: reports, listings, job logs |
 | `list_sessions`, `keys` | housekeeping |
@@ -234,6 +236,71 @@ come back as strings so no digits are lost. The call runs in the same job as
 `QCMDEXC` and `QCAPCMD` are on the block list, so a call can't run commands
 around it. From a shell: `tn5250-run call MYLIB/CALC "char(10)=Ada"
 "packed(7,2)=12.25" "packed(7,2)=0.5" "packed(9,2):out" "char(20):out"`.
+
+### When a call fails
+
+A program that crashes under `call_program` (or `run_command` with `CALL`)
+normally reports only "CEE9901 Application error. RNX9998 unmonitored",
+which tells you nothing. The RPG runtime couldn't send its inquiry message
+in a server job. So on failure the tool reads the job log back to the call
+and reports what actually happened, at its source line:
+
+```text
+FAILED: CALL MYLIB/T5DIV
+error MCH1211 at MYLIB/QRPGLESRC(T5DIV):8 in MYLIB/T5DIV: Attempt made to divide by zero for fixed point operation.
+  RPG status 00102 (RNQ0102): Attempt to divide by zero (C G D F).
+  8 | r = 10 / a;
+```
+
+- **Where.** It reports the message that started it, from the program
+  itself, with its module, procedure (in a service program too) and
+  statement.
+- **The line.** The statement is mapped to a line of the module's source,
+  found through `QSYS2.BOUND_MODULE_INFO`. For ILE RPG a statement number is
+  a line of the compile listing, so `/COPY` and `/INCLUDE` members are
+  expanded to count it. For CL it's the sequence number.
+- **SQL RPG.** Statements refer to the precompiler's output, so you get the
+  statement and a note instead of a line.
+- **RPG status.** It comes from the RNQ message the runtime tried to send
+  (00102 divide by zero, 00121 array index, ...), with its text.
+
+### Describing objects
+
+`describe` shows what code is written against, so the agent uses real field
+names and types instead of guessing:
+
+```text
+describe {"object": "MYLIB/CUSTMAST"}
+→ MYLIB/CUSTMAST *FILE PF - Customers
+    physical file, 1 record format
+    format CUSTR (50 bytes) - customer
+      CUSTID     char(5)          Cust ID
+      NAME       char(30)         Name; alias CUSTOMER_NAME
+      BAL        packed(9:2)
+      SINCE      date(*ISO)
+    keys: CUSTID (unique)
+```
+
+- **Files** (tables, physical, logical, display and printer files): record
+  formats and fields with RPG types, text or column headings, aliases,
+  null-capable fields, and the keys. For display and printer files, also
+  each field's usage (input, output, both, hidden) and position. It comes
+  from `DSPFFD` and `DSPFD TYPE(*ACCPTH)` outfiles in the helper's own
+  `QTEMP`.
+- **Programs and service programs:** their modules with each module's
+  source, the service programs they bind, and a service program's exported
+  procedures and data.
+- **The rest:** a binding directory's entries, a message file's messages
+  (`pattern: "CPF98*"`) and a data area's value.
+- **Without a library**, the library list is searched. When several objects
+  share the name (a program and a file), each is described, unless `type`
+  picks one.
+
+`explain_message` returns a message ID's text, cause and recovery. It looks
+in the message file the prefix points to (RNF/RNS compile, RNQ/RNX run-time,
+CPF/CPD/MCH system, SQL, CEE), which takes about a second, or in `file` for
+your own messages. From a shell: `tn5250-run describe MYLIB/CUSTMAST` and
+`tn5250-run explain RNQ0121`.
 
 ### The PASE shell
 

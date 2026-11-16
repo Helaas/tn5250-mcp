@@ -134,6 +134,7 @@ public class T5250Helper {
             case "ifs_delete": return ifsDelete(ifs(r));
             case "read_member": return readMember(r);
             case "read_source": return readSource(r);
+            case "outfile": return outfile(r);
             case "write_source": return writeSource(r);
             case "spooled_file": return spooledFile(r);
             case "close": {
@@ -483,6 +484,49 @@ public class T5250Helper {
         }
         Map<String, Object> res = new LinkedHashMap<>();
         res.put("records", recs);
+        return res;
+    }
+
+    /** Run a display command (DSPFFD, DSPFD, DSPPGMREF, DSPDBR) into an outfile
+     *  in this connection's QTEMP and return its rows. The command comes from
+     *  the Python side, built from checked names; it may not name an outfile. */
+    static Object outfile(Map<String, Object> r) throws Exception {
+        Conn c = conn(r);
+        String cmd = str(r, "command").trim();
+        String verb = cmd.split("\\s+")[0].toUpperCase();
+        if (!Arrays.asList("DSPFFD", "DSPFD", "DSPPGMREF", "DSPDBR").contains(verb))
+            throw new IllegalArgumentException("not a display command this helper runs: " + verb);
+        String up = cmd.toUpperCase();
+        if (up.contains("OUTFILE") || up.contains("OUTPUT(") || up.contains("'") || up.contains(";"))
+            throw new IllegalArgumentException("bad display command: " + cmd);
+        int max = num(r, "max_rows", 5000);
+        // one outfile per command and TYPE: each has its own record format, and an
+        // existing outfile of another format can't be reused
+        java.util.regex.Matcher tm = java.util.regex.Pattern.compile("TYPE\\((\\*\\w+)\\)").matcher(up);
+        String key = verb + (tm.find() ? tm.group(1) : "");
+        String out = "T5O" + String.format("%07X", key.hashCode() & 0xFFFFFFF);
+        Connection db = internal(c);
+        try (PreparedStatement ps = db.prepareStatement("CALL QSYS2.QCMDEXC(?)")) {
+            ps.setString(1, cmd + " OUTPUT(*OUTFILE) OUTFILE(QTEMP/" + out + ")");
+            ps.execute();
+        }
+        Map<String, Object> res = new LinkedHashMap<>();
+        List<Object> cols = new ArrayList<>(), rows = new ArrayList<>();
+        try (Statement st = db.createStatement();
+             ResultSet rs = st.executeQuery("SELECT * FROM QTEMP/" + out)) {
+            ResultSetMetaData md = rs.getMetaData();
+            for (int i = 1; i <= md.getColumnCount(); i++) cols.add(md.getColumnName(i));
+            while (rs.next() && rows.size() < max) {
+                List<Object> row = new ArrayList<>();
+                for (int i = 1; i <= md.getColumnCount(); i++) {
+                    String v = rs.getString(i);
+                    row.add(v == null ? null : rtrim(v));
+                }
+                rows.add(row);
+            }
+        }
+        res.put("columns", cols);
+        res.put("rows", rows);
         return res;
     }
 

@@ -198,6 +198,9 @@ def cmd_cmd(a) -> int:
     else:
         for m in res.get("messages", []):
             print("%s (severity %s) %s" % (m.get("id") or "-", m.get("severity"), m.get("text")))
+        if res.get("error"):
+            from .runtime import error_text
+            print(error_text(res["error"]))
         print("%s (job %s)" % ("ok" if res["ok"] else "FAILED", res.get("job")), file=sys.stderr)
     hs.close()
     return 0 if res["ok"] else 1
@@ -264,6 +267,9 @@ def cmd_call(a) -> int:
         for m in res.get("messages", []):
             print("%s (severity %s) %s" % (m.get("id") or "-", m.get("severity"), m.get("text")),
                   file=sys.stderr)
+        if res.get("error"):
+            from .runtime import error_text
+            print(error_text(res["error"]), file=sys.stderr)
         print("%s (job %s)" % ("ok" if res["ok"] else "FAILED", res.get("job")), file=sys.stderr)
     hs.close()
     return 0 if res["ok"] else 1
@@ -315,6 +321,25 @@ def cmd_member(a) -> int:
     except (HostServerError, OSError) as e:
         print("FAILED %s" % e, file=sys.stderr)
         return 3
+    hs.close()
+    return 0
+
+
+def cmd_describe(a) -> int:
+    from .hostservers import HostServerError
+    from .objects import describe, describe_text, explain_message, explain_text
+    try:
+        hs = _host(a)
+        if a.fn is cmd_describe and a.what == "explain":
+            res = explain_message(hs, "cli", a.object, a.file)
+            out = json.dumps(res) if a.json else explain_text(res)
+        else:
+            res = describe(hs, "cli", a.object, a.type, a.pattern)
+            out = json.dumps(res) if a.json else describe_text(res)
+    except HostServerError as e:
+        print("FAILED %s" % e, file=sys.stderr)
+        return 3
+    print(out)
     hs.close()
     return 0
 
@@ -465,6 +490,18 @@ def main(argv: list[str] | None = None) -> None:
     b.add_argument("--only", action="append", metavar="OBJECT", help="build just this object")
     _host_args(b)
     b.set_defaults(fn=cmd_build)
+
+    for what, hlp in (("describe", "describe an object: fields and keys, modules, exports"),
+                      ("explain", "a message's text, cause and recovery")):
+        d = sub.add_parser(what, help=hlp)
+        d.add_argument("object", metavar="OBJECT" if what == "describe" else "MESSAGE_ID")
+        if what == "describe":
+            d.add_argument("--type", help="*FILE, *PGM, *SRVPGM, *BNDDIR, *MSGF, *DTAARA")
+            d.add_argument("--pattern", help="message IDs for a message file, e.g. CPF98*")
+        else:
+            d.add_argument("--file", help="LIB/MSGF when it isn't a system message")
+        _host_args(d)
+        d.set_defaults(fn=cmd_describe, what=what, type=None, pattern=None, file=None)
 
     tl = sub.add_parser("tool", help="run a command tool (YAML commands:)")
     tl.add_argument("tool")

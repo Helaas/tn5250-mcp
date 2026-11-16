@@ -79,7 +79,7 @@ def test_source_dates():
 
 def test_members(hs):
     assert hs.source_files("main", "boblib")["rows"] == [["QRPGLESRC", None, "100"]]
-    assert [r[0] for r in hs.members("main", "BOBLIB", "QRPGLESRC")["rows"]] == ["HELLO"]
+    assert "HELLO" in [r[0] for r in hs.members("main", "BOBLIB", "QRPGLESRC")["rows"]]
     r = hs.member_read("main", "boblib/qrpglesrc(hello)")
     assert r["member"] == "BOBLIB/QRPGLESRC(HELLO)" and r["lines"][1][2] == "dsply 'hi';"
     w = hs.member_write("main", "BOBLIB/QRPGLESRC(HELLO)",

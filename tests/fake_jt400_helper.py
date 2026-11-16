@@ -30,6 +30,32 @@ def job_spool(job):
 SRC = {("BOBLIB", "QRPGLESRC", "HELLO"): [["1.00", 240101, "**free"],
                                          ["2.00", 240101, "dsply 'hi';"],
                                          ["3.00", 240101, "*inlr = *on;"]]}
+SRC[("BOBLIB", "QRPGLESRC", "CRASH")] = [[str(i), 240101, t] for i, t in enumerate([
+    "**free", "ctl-opt dftactgrp(*no);", "/copy QRPGLESRC,CPY", "dcl-pi *n;", "end-pi;",
+    "x = 1 / z;", "*inlr = *on;"], 1)]
+SRC[("BOBLIB", "QRPGLESRC", "CPY")] = [["1", 240101, "dcl-s x packed(5:0);"],
+                                       ["2", 240101, "dcl-s z packed(5:0);"]]
+OBJECTS = {"CUSTMAST": [("*FILE", "PF", "Customers")], "CUSTDSP": [("*FILE", "DSPF", "")],
+           "CRASH": [("*PGM", "RPGLE", "crashes")], "UTILS": [("*SRVPGM", "RPGLE", "")],
+           "APP": [("*BNDDIR", "", "")], "APPMSG": [("*MSGF", "", "app messages")],
+           "CFG": [("*DTAARA", "", "")], "DUP": [("*PGM", "CLLE", ""), ("*FILE", "PF", "")]}
+FFD_COLS = ["WHFILE", "WHLIB", "WHFTYP", "WHNAME", "WHTEXT", "WHRLEN", "WHFLDE", "WHFLDB",
+            "WHFLDD", "WHFLDP", "WHFTXT", "WHCHD1", "WHCHD2", "WHCHD3", "WHFLDT", "WHFIOB",
+            "WHALIS", "WHVARL", "WHNULL", "WHFMT", "WHDROW", "WHDCOL"]
+FFD = {"CUSTMAST": [
+    ["CUSTMAST", "BOBLIB", "P", "CUSTR", "customer", "50", "CUSTID", "5", "0", "0", "Cust ID",
+     "Cust", "ID", "", "A", "B", "", "N", "N", "", "0", "0"],
+    ["CUSTMAST", "BOBLIB", "P", "CUSTR", "customer", "50", "NAME", "32", "0", "0", "Name", "NAME",
+     "", "", "A", "B", "CUSTOMER_NAME", "Y", "Y", "", "0", "0"],
+    ["CUSTMAST", "BOBLIB", "P", "CUSTR", "customer", "50", "BAL", "5", "9", "2", "", "BAL", "",
+     "", "P", "B", "", "N", "N", "", "0", "0"],
+    ["CUSTMAST", "BOBLIB", "P", "CUSTR", "customer", "50", "SINCE", "10", "0", "0", "", "SINCE",
+     "", "", "L", "B", "", "N", "N", "*ISO", "0", "0"]],
+    "CUSTDSP": [
+    ["CUSTDSP", "BOBLIB", "D", "SCR1", "", "36", "CUSTID", "5", "0", "0", "", "", "", "", "A",
+     "B", "", "N", "N", "", "3", "2"],
+    ["CUSTDSP", "BOBLIB", "D", "SCR1", "", "36", "OPT", "1", "0", "0", "", "", "", "", "A",
+     "I", "", "N", "N", "", "5", "2"]]}
 SRC_FILE = os.path.join(ROOT, ".fake-members.json")     # members outlive one helper
 if os.path.exists(SRC_FILE):
     SRC = {tuple(k.split("/")): v for k, v in json.load(open(SRC_FILE)).items()}
@@ -177,6 +203,11 @@ def handle(r):
     if op == "call_program":
         if r.get("libl"):
             LIBL[:] = r["libl"]
+        if r["program"].endswith("CRASH"):
+            return {"ok": False, "outputs": [None] * len(r["params"]), "job":
+                    "654321/QUSER/QZRCSRVS", "messages": [{"id": "CEE9901", "severity": 30,
+                    "type": 15, "text": "Application error.  RNX9998 unmonitored by CRASH at "
+                    "statement *N, instruction X'0000'."}]}
         if r["program"].endswith("NOSUCH"):
             return {"ok": False, "outputs": [None] * len(r["params"]), "job":
                     "654321/QUSER/QZRCSRVS", "messages": [{"id": "CPF4101", "severity": 40,
@@ -240,6 +271,73 @@ def handle(r):
     if op == "query" and "VARCHAR_FORMAT(CURRENT TIMESTAMP" in r["sql"]:
         return {"columns": ["TS"], "types": ["VARCHAR"], "rows": [["20261116120000"]],
                 "truncated": False}
+    if op == "outfile":
+        import re as _re
+        if not r["command"].startswith(("DSPFFD", "DSPFD")):
+            raise Exception("not a display command this helper runs")
+        f = _re.search(r"FILE\(\w+/(\w+)\)", r["command"]).group(1)
+        if r["command"].startswith("DSPFFD"):
+            return {"columns": FFD_COLS, "rows": FFD.get(f, [])}
+        return {"columns": ["APKEYF", "APKSEQ", "APKEYN", "APUNIQ"],
+                "rows": [["CUSTID", "A", "1", "Y"]] if f == "CUSTMAST" else []}
+    if op == "query" and "OBJECT_STATISTICS" in r["sql"]:
+        lib, typ, name = r["params"]
+        rows = [[name, t, a, txt or None, "BOBLIB" if lib == "*LIBL" else lib]
+                for t, a, txt in OBJECTS.get(name, []) if typ in ("*ALL", t)]
+        return {"columns": ["OBJNAME", "OBJTYPE", "OBJATTRIBUTE", "OBJTEXT", "OBJLONGSCHEMA"],
+                "types": [], "rows": rows, "truncated": False}
+    if op == "query" and "BOUND_MODULE_INFO" in r["sql"]:
+        pgm = r["params"][1]
+        attr = {"CRASH": "RPGLE", "SQLCRASH": "SQLRPGLE", "CLCRASH": "CLLE", "UTILS": "RPGLE"}
+        rows = [[pgm, attr.get(pgm, "RPGLE"), "BOBLIB", "QRPGLESRC", pgm, None]] if pgm in attr \
+            else []
+        if len(r["params"]) == 3:          # describe: module library first, and more
+            rows = [["BOBLIB"] + x + ["2026-11-16 12:00:00", "*YES"] for x in rows]
+        return {"columns": [], "types": [], "rows": rows, "truncated": False}
+    if op == "query" and "BOUND_SRVPGM_INFO" in r["sql"]:
+        rows = [["BOBLIB", "UTILS"], ["QSYS", "QRNXIE"]] if r["params"][1] == "CRASH" else []
+        return {"columns": [], "types": [], "rows": rows, "truncated": False}
+    if op == "query" and "PROGRAM_EXPORT_IMPORT_INFO" in r["sql"]:
+        return {"columns": [], "types": [], "rows": [["GREET", "*PROCEXP"],
+                                                     ["COUNTER", "*DATAEXP"]], "truncated": False}
+    if op == "query" and "BINDING_DIRECTORY_INFO" in r["sql"]:
+        return {"columns": [], "types": [], "rows": [["BOBLIB", "UTILS", "*SRVPGM", "*IMMED"]],
+                "truncated": False}
+    if op == "query" and "DATA_AREA_INFO" in r["sql"]:
+        return {"columns": [], "types": [], "rows": [["*CHAR", "20", "0", "PROD"]],
+                "truncated": False}
+    if op == "query" and "MESSAGE_FILE_DATA" in r["sql"]:
+        msgs = {"RNQ0102": ("99", "Attempt to divide by zero (C G D F).",
+                            "Cause . . . . . :   RPG procedure &1 tried to divide by zero. "
+                            "Recovery  . . . :   Contact the person responsible."),
+                "RNF7030": ("30", "The name or indicator is not defined.",
+                            "Cause . . . . . :   A field is not defined. Recovery  . . . :   "
+                            "Define it. Compile again."),
+                "APP0001": ("10", "Customer &1 not found.", "No help.")}
+        if len(r["params"]) == 3 and "LIKE" not in r["sql"]:       # one message
+            hit = msgs.get(r["params"][2])
+            return {"columns": [], "types": [], "rows": [list(hit)] if hit else [],
+                    "truncated": False}
+        return {"columns": [], "types": [], "truncated": False,
+                "rows": [["APP0001", "10", "Customer &1 not found."]]}
+    if op == "query" and "FROM_INSTRUCTION" in r["sql"]:     # a crash's job log, newest first
+        def m(i, t, sev, text, lib=None, pgm="QSYS", mod=None, proc=None, stmt="*N", to=None):
+            return [i, t, sev, text, lib, pgm, mod, proc, stmt, to]
+        rows = [
+            m("CEE9901", "ESCAPE", "30", "Application error.  RNX9998 unmonitored by CRASH at "
+              "statement *N, instruction X'0000'.", "QSYS", "QLEAWI", "QLEDEH", "eh", "175"),
+            m("RNX9998", "ESCAPE", "50", "Internal failure in compiler or subroutine.", "QSYS",
+              "QRNXIE", "QRNXMSG", "SignalException", "22"),
+            m("CPF2469", "ESCAPE", "40", "Error occurred when sending message RNQ0102.", "QSYS",
+              "QMHSNINQ"),
+            m("CPF9999", "ESCAPE", "40", "Function check. MCH1211 unmonitored by CRASH at "
+              "statement 0000000008, instruction X'0000'.", None, "QMHUNMSG"),
+            m("MCH1211", "ESCAPE", "40", "Attempt made to divide by zero for fixed point "
+              "operation.", "BOBLIB", "CRASH", "CRASH", "CRASH", "8", "CRASH"),
+            m("CPF5C61", "INFORMATIONAL", "0", "Client request - run program BOBLIB/CRASH."),
+            m("MCH0603", "ESCAPE", "40", "An older error from another call.", "BOBLIB", "OLD",
+              "OLD", "OLD", "3", "OLD")]
+        return {"columns": [], "types": [], "rows": rows, "truncated": False}
     if op == "query" and "JOBLOG_INFO" in r["sql"]:
         return {"columns": ["MESSAGE_TIMESTAMP", "MESSAGE_ID", "MESSAGE_TYPE", "SEVERITY",
                             "MESSAGE_TEXT"], "types": [], "truncated": False,

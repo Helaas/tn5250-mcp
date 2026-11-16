@@ -485,7 +485,10 @@ class HostServers:
                                               for p in self.command_allow):
                 raise HostServerError("%s is not among the commands this server allows: %s"
                                       % (verb, ", ".join(self.command_allow)))
-        return self._run_command(name, cmd, libl)
+        res = self._run_command(name, cmd, libl)
+        if not res.get("ok") and command_name(cmd) == "CALL" and res.get("job"):
+            res["error"] = self.runtime_error(name, res["job"])
+        return res
 
     def server_timestamp(self, name: str) -> str:
         """CURRENT TIMESTAMP on the IBM i, as text CAST(? AS TIMESTAMP) takes."""
@@ -549,9 +552,17 @@ class HostServers:
         res = self.helper.call("call_program", name=name, program=prog, params=plist,
                                **({"libl": libl} if libl else {}))
         self.conns[name]["_cmdjob"] = res.get("job")
+        if not res.get("ok") and res.get("job"):
+            res["error"] = self.runtime_error(name, res["job"])
         self.log(name, "call", "%s with %d parameters -> %s" % (
             prog, len(plist), "ok" if res.get("ok") else "FAILED"))
         return res
+
+    def runtime_error(self, name: str, job: str) -> dict | None:
+        """The error behind a failed call: message, program, procedure, source
+        line, RPG status (see runtime.py). None if the job log shows none."""
+        from .runtime import runtime_error
+        return runtime_error(self, name, job)
 
     def ifs_mkdir(self, name: str, path: str) -> bool:
         """Create a directory (and its parents) for uploads; same rules as writes."""

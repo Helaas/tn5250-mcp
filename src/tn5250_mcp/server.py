@@ -19,6 +19,7 @@ from .flows import Flow, FlowConfigError, FlowError, FlowRunner, FlowSet
 from .credentials import CredentialStore
 from .guard import DEFAULT_BLOCKED, Guard
 from .hostservers import HostServerError, HostServers, format_table, host_login
+from .runtime import error_text
 from .manager import GuardError, Manager, render
 from .profiles import ProfileError, ProfileSet
 from .session import ALL_KEYS
@@ -62,7 +63,7 @@ BUILTIN_TOOLS = {"connect", "disconnect", "list_sessions", "get_screen", "fill",
                  "sql_execute", "ifs_list", "ifs_read", "ifs_write", "forget_password",
                  "run_command", "compile", "job_log", "spooled_files", "spooled_file",
                  "call_program", "build_project", "pase", "source_members", "member_read",
-                 "member_write"}
+                 "member_write", "describe", "explain_message"}
 
 Session_ = Annotated[str, Field(description="session name; lets you run several side by side")]
 Conn_ = Annotated[str, Field(description="name of the host-server connection")]
@@ -501,10 +502,11 @@ def _add_host_tools(mcp: MCPServer, mgr: Manager, hs: HostServers, profiles: Pro
             IBM i's messages. Interactive commands that show screens don't work
             here; use the 5250 session for those. job_log shows more detail."""
             res = await run(hs.command, name, command, libl)
-            return "%s: %s%s%s\njob %s" % (
+            return "%s: %s%s%s%s\njob %s" % (
                 "ok" if res["ok"] else "FAILED", command,
                 " [libl %s]" % " ".join(res["libl"]) if res.get("libl") else "",
-                messages_text(res.get("messages", [])) or "\n  (no messages)", res.get("job"))
+                messages_text(res.get("messages", [])) or "\n  (no messages)",
+                "\n" + error_text(res["error"]) if res.get("error") else "", res.get("job"))
 
     if hs.allow_commands and not read_only:
         @mcp.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=True,
@@ -526,6 +528,8 @@ def _add_host_tools(mcp: MCPServer, mgr: Manager, hs: HostServers, profiles: Pro
             for i, (p, v) in enumerate(zip(params or [], res.get("outputs") or []), 1):
                 if p.get("out"):
                     lines.append("  parameter %d %s = %s" % (i, p.get("type"), json.dumps(v)))
+            if res.get("error"):                 # the real error, at its source line
+                lines.append(error_text(res["error"]))
             msgs = res.get("messages", [])
             if msgs:
                 lines.append("messages:" + messages_text(msgs))
@@ -636,6 +640,42 @@ def _add_host_tools(mcp: MCPServer, mgr: Manager, hs: HostServers, profiles: Pro
             if res["stderr"]:
                 parts.append("--- stderr\n" + res["stderr"].rstrip("\n"))
             return "\n".join(parts)
+
+    @mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True))
+    async def describe(
+        object: Annotated[str, Field(description="NAME or LIB/NAME, e.g. MYLIB/CUSTMAST")],
+        type: Annotated[str | None, Field(description="*FILE, *PGM, *SRVPGM, *BNDDIR, *MSGF, "
+                                                      "*DTAARA; default: all objects of "
+                                                      "that name")] = None,
+        pattern: Annotated[str | None, Field(description="for a message file: message IDs, "
+                                                         "e.g. CPF98*")] = None,
+        format: Annotated[str, Field(description="text or json")] = "text",
+        name: Conn_ = "main",
+    ) -> str:
+        """What an object looks like, to write code against it. A file (table,
+        physical, logical, display, printer): its record formats and fields with
+        RPG types (char(5), packed(9:2), date(*ISO), ...), text, alias, and keys;
+        for display files each field's usage and position. A program or service
+        program: its modules and their sources, bound service programs, and a
+        service program's exported procedures. A binding directory's entries, a
+        message file's messages, a data area's value."""
+        from .objects import describe as _describe, describe_text
+        res = await run(_describe, hs, name, object, type, pattern)
+        return json.dumps(res, ensure_ascii=False) if format == "json" else describe_text(res)
+
+    @mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True))
+    async def explain_message(
+        id: Annotated[str, Field(description="message ID, e.g. RNF7030, RNQ0102, CPF9801, "
+                                             "SQL0204")],
+        file: Annotated[str | None, Field(description="LIB/MSGF when it isn't a system "
+                                                      "message")] = None,
+        name: Conn_ = "main",
+    ) -> str:
+        """A message's text, cause and recovery, from its message file: for
+        compile errors, run-time errors (RNQ: RPG status codes), CL and SQL
+        messages."""
+        from .objects import explain_message as _explain, explain_text
+        return explain_text(await run(_explain, hs, name, id, file))
 
     @mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True))
     async def source_members(
