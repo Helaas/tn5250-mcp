@@ -4,6 +4,10 @@ An MCP server that lets an AI agent drive IBM i (AS/400) 5250 green-screen
 sessions: data entry, automated testing, navigating menus. It ships with a live
 web viewer, so a person can watch, sign on, or take over at any time.
 
+Procedures you use often can be written down as **screen flows** in YAML.
+Each flow becomes an MCP tool with checked parameters, and the same files run
+from a CLI, from Python and from pytest, so they also work as tests in CI.
+
 It speaks the 5250 protocol itself, in pure Python. There is no screen
 scraping, and it doesn't need Java or a terminal emulator. That gives the agent
 the host's real field table: positions, lengths, numeric and signed fields,
@@ -19,6 +23,7 @@ mandatory and hidden fields, and the exact keyboard state.
 | "Is the host done?" | wait for the screen to stop changing | exact: the host's read command + keyboard unlock |
 | Wrong-screen typing | possible | refused (`expect` / `screen_id` checks) |
 | Destructive commands | nothing stops them | configurable block list |
+| Repeatable procedures | prompt the agent again | YAML screen flows, run as tools or tests |
 
 ## Install
 
@@ -27,7 +32,7 @@ git clone https://github.com/Helaas/tn5250-mcp && cd tn5250-mcp
 python3 -m venv .venv && .venv/bin/pip install -e .
 ```
 
-Python 3.11+. The only dependency is the official `mcp` SDK (2.x).
+Python 3.11+. Dependencies: the official `mcp` SDK (2.x) and PyYAML.
 
 ## Hook it up
 
@@ -63,6 +68,7 @@ claude mcp add --transport http tn5250 http://127.0.0.1:8250/mcp
 | `wait` | wait until the host wants input (optionally for some text) |
 | `viewer` | link to the live viewer |
 | `list_sessions`, `disconnect`, `keys` | housekeeping |
+| *your flows* | one tool per screen flow loaded with `--flows` |
 
 Several sessions can run side by side (`session` argument).
 
@@ -73,6 +79,125 @@ Example `press` call:
   "values": { "ID": "3", "NAME": "SPROCKET", "QTY": "-3" } }
 ```
 
+## Screen flows
+
+A flow is a named procedure: a fixed list of steps with typed parameters. The
+agent (or a test) only supplies the parameters; it can't type outside the flow.
+
+```yaml
+toolset: orders                       # default toolset for the flows below
+flows:
+  add_order:
+    description: Add an order on the order entry screen.   # the agent reads this
+    params:
+      customer: {type: string, upper: true, pattern: "^[A-Z0-9]{1,8}$"}
+      qty:      {type: integer, min: 1, max: 9999}
+    steps:
+      - call: open_order_entry        # flows can call flows
+      - name: enter the order
+        expect: "1:ORDER ENTRY"       # must be on screen, or the flow stops
+        fill: {Customer: "{customer}", Quantity: "{qty}"}
+        press: Enter
+        check: {not_text: "not found"}
+        capture: {order_no: 'Order (\d+) created'}
+      - expect: "Order {order_no} created"
+        press: F3
+```
+
+```sh
+tn5250-mcp --flows flows/                  # offer the flows as tools (next to fill/press)
+tn5250-mcp --flows flows/ --flows-only     # only flows: no free typing for the agent
+tn5250-mcp --flows flows/ --toolsets orders,ibmi
+tn5250-run check flows/                    # validate and list
+```
+
+**Parameters** (`params`): `type` is `string` (`min_length`, `max_length`,
+`pattern`, `enum`, `upper`), `integer` or `number` (`min`, `max`, `decimals`),
+`boolean` (typed as `true_value`/`false_value`, default `Y`/`N`) or `secret`
+(`env: VAR`; see below). Add `default` to make a parameter optional, and
+`description` for the agent. Values are checked before anything is typed:
+for this flow, for every flow it calls, and against the block list. A flow is
+refused as a whole; it doesn't stop half-way because of a bad value.
+
+**Steps** (run in order):
+
+| key | meaning |
+|---|---|
+| `expect` | text (or `"row:text"`, or a list) that must be on screen before the step acts. Required for any step that fills or presses (`Reset` excepted). |
+| `when` | only run this step if this text is on screen; otherwise skip it (pop-ups, confirm screens) |
+| `fill` | field → value. Fields by label, `"row,col"`, `"#index"` or `@cursor` |
+| `cursor` | put the cursor on a field or position first |
+| `press` | key to send, then wait for the host's answer |
+| `wait_for`, `timeout` | wait for text after the key (or on its own); default timeout 30 s |
+| `check` | after the step: `text`, `not_text`, `regex`, `keyboard` (`ready`, `error`, `any`; default: an operator error fails the step), `captured` (capture → regex) |
+| `capture` | name → regex with one group, `{field: ref}` or `{rows: "3-22"}`. Usable as `{name}` in later steps and returned to the caller |
+| `call`, `with` | run another flow with these parameters |
+| `fail` | with `when`: stop the flow with this message if the text is there |
+| `name` | step label for logs and errors |
+
+`{name}` inserts a parameter or capture. In regexes the value matches
+literally. Flow options: `description` (required), `toolset`, `read_only`
+(your promise that the flow only displays things; such a flow may only call
+other read-only flows), `expose: false` (a helper for other flows, not a tool).
+
+A failing flow reports the flow, the step and the screen at that moment. Over
+MCP, a flow returns its step log, its captures and the final screen.
+
+See [`examples/flows/`](examples/flows/): `ibmi.yaml` (`run_command`, a
+read-only `sql_select`) and `dfu_demo.yaml` (data entry through UPDDTA, plus
+`data_entry_test`, the end-to-end test).
+
+## Scripts, CI and pytest
+
+The flows and the engine work without an MCP client.
+
+**Command line:**
+
+```sh
+tn5250-run run --host pub400.com --flows examples/flows data_entry_test lib=MYLIB
+```
+
+Sign-on: `--signon env` uses `$T5250_USER` / `$T5250_PASSWORD` (CI secrets),
+and `--signon viewer` prints a viewer link and waits for a person. `auto`, the
+default, uses env when `$T5250_PASSWORD` is set. Add `--signoff`, `--json`,
+`--screen` or `--log-dir logs` for transcripts. Exit codes: 0 passed, 1 flow
+failed, 2 invalid flows or arguments, 3 connection or sign-on problem.
+
+**Python:**
+
+```python
+from tn5250_mcp import Terminal
+
+with Terminal("pub400.com", flows=["flows/"], log_dir="logs") as t:
+    t.signon()                                   # from $T5250_USER / $T5250_PASSWORD
+    r = t.run("add_order", customer="c100", qty=3)
+    print(r.captures["order_no"])
+    t.press("F3", expect="ORDER ENTRY")          # raw keys work too
+    t.signoff()
+```
+
+**pytest** (the plugin is installed with the package):
+
+```python
+def test_add_order(t5250):                       # a signed-on session for the test run
+    r = t5250.run("add_order", customer="C100", qty=3)
+    assert r.captures["order_no"]
+```
+
+```sh
+T5250_HOST=pub400.com T5250_USER=... T5250_PASSWORD=... pytest --t5250-flows flows/
+```
+
+Without `T5250_HOST`, tests that use `t5250` are skipped. Without a password,
+pass `--t5250-viewer-port 0` to sign on by hand in the viewer. A failing
+test's report includes the 5250 screen. `--t5250-log-dir` keeps transcripts as
+test evidence.
+
+**Passwords:** `secret` parameters and `signon()` read the environment, so
+credentials come from your CI's secret store, never from the agent. Flows with
+secrets are never offered over MCP, and their values are masked in logs and
+results. Over MCP, a person signs on in the viewer.
+
 ## Safety rails
 
 - **Screen checks (on by default).** Every `fill`/`press` must carry `expect`
@@ -80,11 +205,14 @@ Example `press` call:
   last read). If the screen changed in the meantime, because the host moved on
   or a person typed in the viewer, the call is refused.
 - **Block list.** Values containing commands such as `PWRDWNSYS`, `ENDSBS`,
-  `DLTLIB`, `CLRLIB`, `DLTUSRPRF`, `CHGSYSVAL`, `DROP SCHEMA` are refused (full
-  list in `src/tn5250_mcp/guard.py`). Add your own with `--block REGEX`. It's a
+  `DLTLIB`, `CLRLIB`, `DLTUSRPRF`, `CHGSYSVAL`, `DROP SCHEMA` or `QCMDEXC` are
+  refused (full list in `src/tn5250_mcp/guard.py`). Add your own with `--block REGEX`. It's a
   seatbelt, not a security boundary: give the agent's user profile only the
   authority it needs.
 - **Host allow list.** `--allowed-hosts "dev400,*.test.example.com"`.
+- **Flows instead of free typing.** `--flows-only` removes `fill` and `press`, so
+  the agent can read screens and run your flows, nothing else. `--read-only`
+  also drops every flow not marked `read_only`.
 - **Passwords stay with people.** Hidden (non-display) fields are never shown
   to the agent. Sign on in the viewer; the agent carries on from there.
 - **Per-tool permissions.** Read tools are marked read-only and `press` is
@@ -115,15 +243,22 @@ listens on 127.0.0.1 and needs the random token, and it checks the Host header.
 | `--log-dir` | `T5250_LOG_DIR` | no logs |
 | | `T5250_VIEWER_TOKEN` | random per start (set it to keep viewer links valid across restarts) |
 | `--codepage` | `T5250_CODEPAGE` | `cp037` (also cp273, cp500, cp1140, …) |
+| `--flows PATH` (repeatable) | `T5250_FLOWS` (`:`-separated) | none |
+| `--toolsets a,b` | `T5250_TOOLSETS` | all |
+| `--flows-only` | `T5250_FLOWS_ONLY=1` | off |
+| `--read-only` | `T5250_READ_ONLY=1` | off |
 
 ## Examples and tests
 
 - `examples/call.py TOOL '{json args}'`: call one tool against an HTTP server.
-- `examples/data_entry_test.py LIB`: end-to-end test. It creates a table, keys
-  three records through UPDDTA (one negative quantity), checks them with STRSQL,
-  then cleans up.
-- `pytest`: offline protocol tests (data stream parsing, field encoding, signed
-  numbers, save/restore screens, guards).
+- `examples/flows/`: example screen flows, including `data_entry_test`, an
+  end-to-end test. It creates a table, keys three records through UPDDTA (one
+  negative quantity), checks them with STRSQL, then drops the table.
+- `examples/data_entry_test.py LIB`: the same test written as an MCP client
+  script, using `press` directly.
+- `pytest`: offline tests (data stream parsing, field encoding, signed
+  numbers, save/restore screens, guards, flows, MCP flow tools, CLI). They use
+  a scripted fake host, so no IBM i is needed.
 
 A free public IBM i to try it on: [PUB400.COM](https://pub400.com).
 

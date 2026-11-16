@@ -551,6 +551,13 @@ class Session:
     def resolve(self, ref: str) -> list[Field]:
         groups = self.buf.input_fields()
         ref = str(ref).strip()
+        if ref == "@cursor":
+            a = self.buf.user_cursor
+            for g in groups:
+                if any(f.start <= a < f.start + f.length for f in g):
+                    return g
+            raise FieldError("the cursor (%d,%d) is not in an input field"
+                             % self.buf.rowcol(a))
         m = re.fullmatch(r"(\d+)\s*,\s*(\d+)", ref)
         if m:
             a = self.buf.addr(int(m.group(1)), int(m.group(2)))

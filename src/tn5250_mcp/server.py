@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import inspect
 import os
 import sys
-from typing import Annotated
+from typing import Annotated, Any
 
 import anyio
 from mcp.server.mcpserver import MCPServer
@@ -13,6 +14,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp_types import ToolAnnotations
 from pydantic import Field
 
+from .flows import Flow, FlowConfigError, FlowError, FlowRunner, FlowSet
 from .guard import DEFAULT_BLOCKED, Guard
 from .manager import GuardError, Manager, render
 from .session import ALL_KEYS
@@ -32,18 +34,72 @@ Workflow: connect -> get_screen -> fill / press -> read the screen that press re
   and let them sign on there, then continue. Hidden fields are never shown to you.
 - keyboard ERROR means an operator error: read the message line, press Reset.
   keyboard BUSY means the host is still working: call wait.
+- Other tools may be screen flows defined by the user (whole procedures such as
+  "add an order"). When one fits the task, use it instead of fill/press: it
+  checks every screen on the way and validates its parameters.
 """
+
+BUILTIN_TOOLS = {"connect", "disconnect", "list_sessions", "get_screen", "fill", "press",
+                 "wait", "viewer", "keys"}
 
 Session_ = Annotated[str, Field(description="session name; lets you run several side by side")]
 
 
-def build_server(mgr: Manager) -> MCPServer:
-    mcp = MCPServer("tn5250", instructions=INSTRUCTIONS, version="0.1.0")
+def _flow_annotation(p) -> Any:
+    """Type + JSON-schema hints for a flow parameter. Constraints are only
+    advertised here; FlowRunner enforces them (one set of rules everywhere)."""
+    hints: dict[str, Any] = {}
+    if p.type == "boolean":
+        t: Any = bool
+    elif p.type == "integer":
+        t = int
+    elif p.type == "number":
+        t = float
+    else:
+        t = str
+    for k, js in (("min_length", "minLength"), ("max_length", "maxLength"),
+                  ("pattern", "pattern"), ("enum", "enum"), ("min", "minimum"),
+                  ("max", "maximum")):
+        v = getattr(p, k)
+        if v is not None and not (p.upper and k in ("pattern", "enum")):
+            hints[js] = v
+    desc = p.description
+    if p.upper:
+        desc = (desc + " " if desc else "") + "(uppercased)"
+    if p.decimals is not None:
+        desc = (desc + " " if desc else "") + "(max %d decimals)" % p.decimals
+    return Annotated[t, Field(description=desc or None, json_schema_extra=hints or None)]
+
+
+def _start_screen(f: Flow, flows: FlowSet) -> list[str]:
+    """What the first screen-checking step expects, following calls."""
+    for st in f.steps:
+        if st.call:
+            got = _start_screen(flows.flows[st.call], flows)
+            if got:
+                return got
+        elif st.expect or st.when:
+            return st.expect or st.when
+    return []
+
+
+def _flow_description(f: Flow, flows: FlowSet) -> str:
+    start = _start_screen(f, flows)
+    return "%s\n\n(screen flow%s%s)" % (
+        f.description, "; starts on a screen showing %s" % " + ".join(map(repr, start))
+        if start else "", "; read-only" if f.read_only else "")
+
+
+def build_server(mgr: Manager, flows: FlowSet | None = None,
+                 toolsets: list[str] | None = None, flows_only: bool = False,
+                 read_only: bool = False) -> MCPServer:
+    mcp = MCPServer("tn5250", instructions=INSTRUCTIONS, version="0.2.0")
+    runner = FlowRunner(mgr, flows) if flows else None
 
     async def run(fn, *a, **k):
         try:
             return await anyio.to_thread.run_sync(lambda: fn(*a, **k))
-        except GuardError as e:
+        except (GuardError, FlowError) as e:
             raise ToolError(str(e)) from None
         except (OSError, ConnectionError) as e:
             raise ToolError("connection problem: %s" % e) from None
@@ -100,7 +156,6 @@ def build_server(mgr: Manager) -> MCPServer:
         s = await run(mgr.get, session)
         return render(s.snapshot(), show_fields=fields)
 
-    @mcp.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False))
     async def fill(
         values: Annotated[dict[str, str], Field(
             description='field -> value, e.g. {"5,25": "QSECOFR", "Option": "2"}; '
@@ -116,8 +171,6 @@ def build_server(mgr: Manager) -> MCPServer:
         await run(mgr.fill, s, values, expect, screen_id)
         return render(s.snapshot())
 
-    @mcp.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=True,
-                                          open_world_hint=True))
     async def press(
         key: Annotated[str, Field(description="Enter, F1-F24, PageUp, PageDown, Help, "
                                               "Clear, Print, SysReq, Attn, Reset")],
@@ -144,6 +197,13 @@ def build_server(mgr: Manager) -> MCPServer:
             timeout, " / %r" % wait_for if wait_for else "")
         return head + render(s.snapshot())
 
+    if not (flows_only or read_only):
+        mcp.add_tool(fill, annotations=ToolAnnotations(read_only_hint=False,
+                                                       destructive_hint=False))
+        mcp.add_tool(press, annotations=ToolAnnotations(read_only_hint=False,
+                                                        destructive_hint=True,
+                                                        open_world_hint=True))
+
     @mcp.tool(annotations=ToolAnnotations(read_only_hint=True))
     async def wait(
         text: Annotated[str | None, Field(description="wait until this text is on screen")] = None,
@@ -167,7 +227,36 @@ def build_server(mgr: Manager) -> MCPServer:
         """List the key names press accepts."""
         return ", ".join(ALL_KEYS)
 
+    if flows:
+        for f in flows.select(toolsets, read_only):
+            _add_flow_tool(mcp, f, flows, runner, run)
     return mcp
+
+
+def _add_flow_tool(mcp: MCPServer, f: Flow, flows: FlowSet, runner: FlowRunner,
+                   run) -> None:
+    if f.name in BUILTIN_TOOLS:
+        raise FlowConfigError("%s: flow %s has the same name as a built-in tool"
+                              % (f.source, f.name))
+
+    async def tool(**kw):
+        session = kw.pop("session", "main")
+        s = await run(runner.mgr.get, session)
+        res = await run(runner.run, s, f.name, kw)
+        return str(res)
+
+    params = [inspect.Parameter(p.name, inspect.Parameter.KEYWORD_ONLY,
+                                annotation=_flow_annotation(p),
+                                default=inspect.Parameter.empty if p.required else p.default)
+              for p in f.params.values()]
+    params.append(inspect.Parameter("session", inspect.Parameter.KEYWORD_ONLY,
+                                    annotation=Session_, default="main"))
+    tool.__signature__ = inspect.Signature(params, return_annotation=str)
+    tool.__name__ = f.name
+    mcp.add_tool(tool, name=f.name, description=_flow_description(f, flows),
+                 annotations=ToolAnnotations(read_only_hint=f.read_only,
+                                             destructive_hint=not f.read_only,
+                                             open_world_hint=True))
 
 
 def _env_list(name: str) -> list[str]:
@@ -196,7 +285,22 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--log-dir", default=os.environ.get("T5250_LOG_DIR"),
                    help="write a transcript of every session here")
     p.add_argument("--codepage", default=os.environ.get("T5250_CODEPAGE", "cp037"))
+    p.add_argument("--flows", action="append",
+                   default=[x for x in os.environ.get("T5250_FLOWS", "").split(os.pathsep) if x],
+                   help="YAML file or folder of screen flows to offer as tools (repeatable)")
+    p.add_argument("--toolsets", default=os.environ.get("T5250_TOOLSETS", ""),
+                   help="comma-separated toolsets: only offer flows from these")
+    p.add_argument("--flows-only", action="store_true",
+                   default=os.environ.get("T5250_FLOWS_ONLY") == "1",
+                   help="no fill/press tools: the agent can only read screens and run flows")
+    p.add_argument("--read-only", action="store_true",
+                   default=os.environ.get("T5250_READ_ONLY") == "1",
+                   help="no fill/press, and only flows marked read_only")
     a = p.parse_args(argv)
+    try:
+        flowset = FlowSet.load(a.flows) if a.flows else None
+    except FlowConfigError as e:
+        p.exit(2, "tn5250-mcp: %s\n" % e)
 
     blocked = ([] if a.no_default_blocks else list(DEFAULT_BLOCKED)) + list(a.block)
     guard = Guard(require_check=not a.no_require_check,
@@ -212,7 +316,14 @@ def main(argv: list[str] | None = None) -> None:
         except OSError as e:
             print("tn5250-mcp: viewer not started (%s)" % e, file=sys.stderr)
 
-    server = build_server(mgr)
+    toolsets = [t.strip() for t in a.toolsets.split(",") if t.strip()] or None
+    try:
+        server = build_server(mgr, flowset, toolsets, a.flows_only, a.read_only)
+    except FlowConfigError as e:
+        p.exit(2, "tn5250-mcp: %s\n" % e)
+    if flowset:
+        offered = [f.name for f in flowset.select(toolsets, a.read_only)]
+        print("tn5250-mcp: flow tools: %s" % (", ".join(offered) or "none"), file=sys.stderr)
     if a.transport == "stdio":
         server.run("stdio")
     else:

@@ -1,0 +1,245 @@
+"""Python API: drive a 5250 session from a script or a test, no MCP client
+needed. Same engine, guard and flows as the MCP server.
+
+    from tn5250_mcp import Terminal
+
+    with Terminal("pub400.com", flows=["flows/"]) as t:
+        t.signon()                     # $T5250_USER / $T5250_PASSWORD
+        r = t.run("add_order", customer="C100", qty=3)
+        print(r.captures["order_no"])
+"""
+
+from __future__ import annotations
+
+import os
+import time
+from typing import Any
+
+from .flows import FlowError, FlowResult, FlowRunner, FlowSet
+from .guard import Guard
+from .manager import GuardError, Manager, render
+from .session import FieldError, Session
+
+_CONTINUE_SCREENS = ("Display Program Messages", "Press Enter to continue")
+
+
+class TerminalError(Exception):
+    """Something went wrong driving the screen; the message includes the
+    screen at the time."""
+
+
+class Terminal:
+    def __init__(self, host: str, port: int = 992, *, tls: bool = True,
+                 verify_tls: bool = True, flows: FlowSet | list[str] | None = None,
+                 session: str = "main", device_name: str | None = None, wide: bool = False,
+                 codepage: str = "cp037", log_dir: str | None = None,
+                 guard: Guard | None = None, viewer_port: int | None = None,
+                 timeout: float = 20.0):
+        self.host, self.port, self.tls, self.verify_tls = host, port, tls, verify_tls
+        self.name, self.device_name, self.wide = session, device_name, wide
+        self.timeout = timeout
+        # Scripts are written by people, so screen checks are optional here;
+        # the block list still applies.
+        self.mgr = Manager(guard or Guard(require_check=False), log_dir=log_dir,
+                           default_codepage=codepage)
+        if flows is None or isinstance(flows, FlowSet):
+            self.flows = flows
+        else:
+            self.flows = FlowSet.load(list(flows))
+        self.runner = FlowRunner(self.mgr, self.flows or FlowSet())
+        self._viewer_port = viewer_port
+        self.s: Session | None = None
+
+    # -- lifecycle ---------------------------------------------------------
+    def connect(self) -> "Terminal":
+        try:
+            self.s = self.mgr.connect(self.name, self.host, self.port, self.tls,
+                                      self.verify_tls, self.device_name, self.wide, None,
+                                      self.timeout)
+        except GuardError as e:
+            raise TerminalError(str(e)) from None
+        if self._viewer_port is not None:
+            self.start_viewer(self._viewer_port)
+        return self
+
+    def close(self) -> None:
+        if self.s is not None and self.name in self.mgr.sessions:
+            self.mgr.disconnect(self.name)
+        self.s = None
+
+    def __enter__(self) -> "Terminal":
+        return self.connect() if self.s is None else self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+    @property
+    def session(self) -> Session:
+        if self.s is None:
+            raise TerminalError("not connected; call connect() first")
+        return self.s
+
+    def start_viewer(self, port: int = 0) -> str:
+        """Start the live viewer (port 0 = any free port) and return its URL."""
+        if not self.mgr.viewer_url:
+            from .viewer import start_viewer
+            self.mgr.viewer_url = start_viewer(self.mgr, port)
+        return self.mgr.viewer_url
+
+    @property
+    def viewer_url(self) -> str | None:
+        return self.mgr.viewer_url
+
+    # -- reading -------------------------------------------------------------
+    def screen(self, fields: bool = True) -> str:
+        return render(self.session.snapshot(), show_fields=fields)
+
+    @property
+    def rows(self) -> list[str]:
+        return self.session.rows()
+
+    @property
+    def text(self) -> str:
+        return "\n".join(self.rows)
+
+    @property
+    def keyboard(self) -> str:
+        return self.session.keyboard_state()
+
+    def on(self, expect: str) -> bool:
+        """True if `expect` (text, or "row:text") is on the screen."""
+        return self.mgr.guard.expect_matches(self.rows, expect)
+
+    def assert_on(self, expect: str) -> None:
+        if not self.on(expect):
+            raise TerminalError("expected %r on the screen\n%s" % (expect, self.screen()))
+
+    def on_signon(self) -> bool:
+        """A sign-on screen: a hidden (password) input field next to a visible
+        one, and the word 'password' or 'sign on' on screen. Works for custom
+        sign-on screens too (PUB400's has no 'Sign On' title)."""
+        fields = self.session.buf.input_fields()
+        text = self.text.lower()
+        return (any(g[0].hidden for g in fields) and any(not g[0].hidden for g in fields)
+                and ("password" in text or "sign on" in text))
+
+    def field(self, ref: str) -> str:
+        """Current text of an input field (not for hidden fields)."""
+        s = self.session
+        try:
+            g = s.resolve(ref)
+        except FieldError as e:
+            raise TerminalError(str(e)) from None
+        if g[0].hidden:
+            raise TerminalError("field %s is hidden" % ref)
+        return s.buf.field_text(g, s.cp).rstrip()
+
+    # -- acting --------------------------------------------------------------
+    def fill(self, values: dict[str, str], expect: str | None = None) -> None:
+        try:
+            self.mgr.fill(self.session, values, expect)
+        except GuardError as e:
+            raise TerminalError("%s\n%s" % (e, self.screen())) from None
+
+    def press(self, key: str, values: dict[str, str] | None = None, *,
+              expect: str | None = None, cursor: str | None = None,
+              wait_for: str | None = None, timeout: float = 30.0, _mask=()) -> str:
+        """Fill (optional), send a key, wait for the answer, return the screen."""
+        try:
+            ok = self.mgr.press(self.session, key, values, cursor, expect, None, True,
+                                wait_for, timeout, mask=_mask)
+        except GuardError as e:
+            raise TerminalError("%s\n%s" % (e, self.screen())) from None
+        if not ok:
+            raise TerminalError("the host didn't answer within %gs%s\n%s" % (
+                timeout, " (waiting for %r)" % wait_for if wait_for else "", self.screen()))
+        return self.screen()
+
+    def wait(self, text: str | None = None, timeout: float = 30.0) -> bool:
+        return self.session.wait(timeout, text)
+
+    def run(self, flow: str, **params: Any) -> FlowResult:
+        """Run a screen flow. Raises FlowError (with the screen) on failure."""
+        if not self.flows:
+            raise TerminalError("no flows loaded (pass flows=[...] to Terminal)")
+        return self.runner.run(self.session, flow, params)
+
+    # -- sign on / off -------------------------------------------------------
+    def signon(self, user: str | None = None, password: str | None = None, *,
+               user_env: str = "T5250_USER", password_env: str = "T5250_PASSWORD",
+               timeout: float = 60.0) -> str:
+        """Sign on with credentials from the arguments or the environment
+        (meant for CI secrets). Handles the usual 'press Enter' screens after
+        sign-on. Returns the first screen after signing on."""
+        user = user or os.environ.get(user_env)
+        password = password or os.environ.get(password_env)
+        if not user or not password:
+            raise TerminalError("sign-on needs $%s and $%s" % (user_env, password_env))
+        s = self.session
+        s.wait(10)
+        if not self.on_signon():
+            raise TerminalError("not on a sign-on screen\n%s" % self.screen())
+        fields = s.buf.input_fields()
+        pw = next((g for g in fields if g[0].hidden), None)
+        if pw is None:
+            raise TerminalError("no password field on the Sign On screen")
+        try:
+            ug = s.resolve("user")
+            if ug[0].hidden:
+                raise FieldError("hidden")
+        except FieldError:
+            ug = next(g for g in fields if not g[0].hidden)
+        ref = lambda g: "%d,%d" % s.buf.rowcol(g[0].start)  # noqa: E731
+        self.press("Enter", {ref(ug): user, ref(pw): password}, timeout=timeout,
+                   _mask=[password])
+        return self._after_signon(timeout)
+
+    def signon_in_viewer(self, timeout: float = 600.0, announce=print) -> str:
+        """Let a person sign on in the live viewer; wait until they have."""
+        url = self.start_viewer(self._viewer_port or 0)
+        announce("Sign on in the viewer: %s" % url)
+        deadline = time.monotonic() + timeout
+        while self.on_signon():
+            if time.monotonic() > deadline:
+                raise TerminalError("nobody signed on within %gs" % timeout)
+            self.session.wait(2.0)
+            time.sleep(0.5)
+        return self._after_signon(60.0)
+
+    def _after_signon(self, timeout: float) -> str:
+        for _ in range(5):
+            self.session.wait(timeout)
+            if self.on_signon():
+                msg = self.session.snapshot()["message_line"].strip()
+                raise TerminalError("sign-on refused: %s" % (msg or "(no message)"))
+            if self.keyboard == "error":
+                raise TerminalError("sign-on refused: %s"
+                                    % self.session.snapshot()["message_line"].strip())
+            screen = next((t for t in _CONTINUE_SCREENS if self.on(t)), None)
+            if not screen:
+                return self.screen()
+            self.press("Enter", expect=screen, timeout=timeout)
+        raise TerminalError("still not past the sign-on messages\n%s" % self.screen())
+
+    def signoff(self) -> None:
+        """Type SIGNOFF on the command line of the current screen and close."""
+        s = self.session
+        target = None
+        for ref in ("Selection or command", "command", "===>"):
+            try:
+                target = s.resolve(ref)
+                break
+            except FieldError:
+                continue
+        if target is None:
+            raise TerminalError("no command line on this screen to sign off from\n%s"
+                                % self.screen())
+        ref = "%d,%d" % s.buf.rowcol(target[0].start)
+        try:
+            self.mgr.press(s, "Enter", {ref: "SIGNOFF"}, None, None, None, True, None, 10.0)
+        except (GuardError, OSError):
+            pass
+        self.close()
+
+
+__all__ = ["Terminal", "TerminalError", "FlowError", "FlowResult", "FlowSet"]

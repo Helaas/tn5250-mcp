@@ -97,14 +97,15 @@ class Manager:
         s.log(kind, text)
 
     @staticmethod
-    def masked(s: Session, values: dict[str, str]) -> dict[str, str]:
+    def masked(s: Session, values: dict[str, str], mask=()) -> dict[str, str]:
+        """Values for the log: hidden fields and known secrets become ***."""
         out = {}
         for ref, v in values.items():
             try:
                 hidden = s.resolve(ref)[0].hidden
             except FieldError:
                 hidden = False
-            out[ref] = "***" if hidden else v
+            out[ref] = "***" if hidden or any(m and m in v for m in mask) else v
         return out
 
     # -- sessions ------------------------------------------------------------
@@ -161,7 +162,7 @@ class Manager:
 
     # -- actions ---------------------------------------------------------------
     def fill(self, s: Session, values: dict[str, str], expect=None, screen_id=None,
-             from_viewer: bool = False) -> None:
+             from_viewer: bool = False, mask=()) -> None:
         if not from_viewer:
             try:
                 self.guard.check_values(values)
@@ -175,12 +176,12 @@ class Manager:
             except (FieldError, ProtocolError) as e:
                 raise GuardError(str(e)) from None
         s.log("fill" + (" (viewer)" if from_viewer else ""),
-              repr(self.masked(s, values)))
+              repr(self.masked(s, values, mask)))
 
     def press(self, s: Session, key: str, values: dict[str, str] | None = None,
               cursor: str | None = None, expect=None, screen_id=None,
               wait: bool = True, wait_for: str | None = None, timeout: float = 30.0,
-              from_viewer: bool = False) -> bool:
+              from_viewer: bool = False, mask=()) -> bool:
         values = values or {}
         if not from_viewer:
             try:
@@ -199,10 +200,14 @@ class Manager:
             except (FieldError, ProtocolError) as e:
                 raise GuardError(str(e)) from None
         s.log("press %s%s" % (key, " (viewer)" if from_viewer else ""),
-              "values=%r cursor=%r" % (self.masked(s, values), cursor))
+              "values=%r cursor=%r" % (self.masked(s, values, mask), cursor))
         ok = True
         if wait and norm_key(key) != "reset":
             time.sleep(0.05)
             ok = s.wait(timeout=timeout, text=wait_for)
-        s.log("screen", render(s.snapshot()))
+        text = render(s.snapshot())
+        for m in mask:
+            if m:
+                text = text.replace(m, "***")
+        s.log("screen", text)
         return ok

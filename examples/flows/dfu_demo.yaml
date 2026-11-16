@@ -1,0 +1,98 @@
+# Data entry through UPDDTA (DFU) screens on a demo table LIB/T5250TEST.
+# data_entry_test is the end-to-end test: create the table, key in three
+# records (one with a negative quantity), check them with SQL, drop the table.
+#
+#   tn5250-run run --host pub400.com --flows examples/flows data_entry_test lib=MYLIB
+
+toolset: dfu_demo
+flows:
+  create_test_table:
+    description: (Re)create the demo table LIB/T5250TEST (ID, NAME, QTY), empty.
+    params:
+      lib: &lib {type: string, upper: true, pattern: '^[A-Z$#@][A-Z0-9_$#@]{0,9}$',
+                 description: "library to put the table in"}
+    steps:
+      - name: drop the old table
+        expect: "IBM i Main Menu"
+        fill: {"Selection or command": "DLTF FILE({lib}/T5250TEST)"}
+        press: Enter
+        check: {keyboard: any}               # "not found" is fine
+      - name: clear a not-found error
+        press: Reset
+      - name: create
+        call: run_command
+        with:
+          command: >-
+            RUNSQL SQL('CREATE TABLE {lib}/T5250TEST (ID INT NOT NULL PRIMARY KEY,
+            NAME CHAR(20) NOT NULL, QTY DECIMAL(5,0) NOT NULL)') COMMIT(*NONE)
+
+  drop_test_table:
+    description: Delete the demo table LIB/T5250TEST.
+    params: {lib: *lib}
+    steps:
+      - call: run_command
+        with: {command: "DLTF FILE({lib}/T5250TEST)"}
+
+  start_data_entry:
+    description: Open UPDDTA (DFU) on LIB/T5250TEST, ready to add records.
+    params: {lib: *lib}
+    steps:
+      - expect: "IBM i Main Menu"
+        fill: {"Selection or command": "UPDDTA FILE({lib}/T5250TEST)"}
+        press: Enter
+        check: {text: "1:ENTRY"}
+
+  add_record:
+    description: >-
+      Add one record on the UPDDTA entry screen (open it with start_data_entry).
+      Fails if DFU shows a message, e.g. a duplicate ID.
+    params:
+      id: {type: integer, min: 1, max: 2147483647}
+      name: {type: string, min_length: 1, max_length: 20}
+      qty: {type: integer, min: -99999, max: 99999, description: "negative is fine"}
+    steps:
+      - expect: "1:ENTRY"
+        fill: {ID: "{id}", NAME: "{name}", QTY: "{qty}"}
+        press: Enter
+        check:
+          text: "1:ENTRY"
+          regex: '\n *\Z'                      # message line stays empty
+
+  end_data_entry:
+    description: >-
+      Leave UPDDTA (F3) and check how many records it says were added. Ends on
+      the main menu.
+    params:
+      expect_added: {type: integer, min: 0}
+    steps:
+      - expect: "1:ENTRY"
+        press: F3
+        check:
+          text: "End Data Entry"
+          regex: 'Added[^:\n]*:\s+{expect_added}\b'
+        capture: {added: 'Added[^:\n]*:\s+(\d+)'}
+      - expect: "End Data Entry"
+        press: Enter
+        check: {text: "IBM i Main Menu"}
+
+  data_entry_test:
+    description: End-to-end data-entry test on LIB/T5250TEST (creates and drops it).
+    params: {lib: *lib}
+    steps:
+      - call: create_test_table
+        with: {lib: "{lib}"}
+      - call: start_data_entry
+        with: {lib: "{lib}"}
+      - {call: add_record, with: {id: 1, name: WIDGET, qty: 25}}
+      - {call: add_record, with: {id: 2, name: GADGET, qty: 100}}
+      - {call: add_record, with: {id: 3, name: SPROCKET, qty: -3}}
+      - call: end_data_entry
+        with: {expect_added: 3}
+      - name: rows as entered
+        call: sql_select
+        with: {statement: "SELECT ID, NAME, QTY FROM {lib}/T5250TEST ORDER BY ID"}
+        check:
+          captured:
+            result: ['\b1\s+WIDGET\s+25\b', '\b2\s+GADGET\s+100\b', '\b3\s+SPROCKET\s+3-']
+      - call: drop_test_table
+        with: {lib: "{lib}"}

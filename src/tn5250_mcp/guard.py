@@ -15,6 +15,7 @@ DEFAULT_BLOCKED = [
     r"DLTLIB", r"CLRLIB", r"DLTUSRPRF", r"CHGUSRPRF", r"CRTUSRPRF", r"CHGSYSVAL",
     r"RCLSTG", r"INZSYS", r"STRSST", r"RMVDIR", r"GRTOBJAUT", r"RVKOBJAUT",
     r"CHGOBJOWN", r"DROP\s+(SCHEMA|COLLECTION)",
+    r"QCMDEXC",          # runs any CL command from SQL or a program call
 ]
 
 

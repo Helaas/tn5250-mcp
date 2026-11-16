@@ -1,0 +1,58 @@
+# General IBM i flows. All of them start and end on the IBM i Main Menu.
+
+toolset: ibmi
+flows:
+  run_command:
+    description: >-
+      Run a CL command from the IBM i Main Menu command line, for commands that
+      don't open a screen of their own. Fails on an error message.
+    # A free-form command line would undo the point of a flows-only server,
+    # so this is a helper for other flows, not a tool.
+    expose: false
+    params:
+      command: {type: string, min_length: 1, max_length: 153, description: "CL command"}
+    steps:
+      - expect: "IBM i Main Menu"
+        fill: {"Selection or command": "{command}"}
+        press: Enter
+        timeout: 120
+        check: {text: "IBM i Main Menu"}
+        capture: {message: '\n([^\n]*)\Z'}     # message line (last row)
+
+  sql_select:
+    description: >-
+      Run one SELECT (or WITH) statement in interactive SQL (STRSQL) and return
+      the first page of the result. Returns `result`: the result rows as shown.
+    read_only: true
+    params:
+      statement:
+        type: string
+        max_length: 1000
+        # one statement, a query only (QCMDEXC is refused by the block list)
+        pattern: '^\s*(SELECT|select|Select|WITH|with|With)\s[^;]*$'
+        description: "SELECT ... statement; no trailing semicolon"
+    steps:
+      - name: start STRSQL
+        expect: "IBM i Main Menu"
+        fill: {"Selection or command": "STRSQL"}
+        press: Enter
+        check: {text: "Enter SQL Statements"}
+      - name: run the query
+        expect: "Enter SQL Statements"
+        fill: {"@cursor": "{statement}"}       # STRSQL puts the cursor on its input line
+        press: Enter
+        timeout: 120
+        check: {text: "Display Data"}
+        capture: {result: {rows: "3-22"}}
+      - name: back to the statement screen
+        expect: "Display Data"
+        press: F3
+        check: {text: "Enter SQL Statements"}
+      - name: leave STRSQL
+        expect: "Enter SQL Statements"
+        press: F3
+        check: {text: "Exit Interactive SQL"}
+      - name: save session and exit
+        expect: "Exit Interactive SQL"
+        press: Enter
+        check: {text: "IBM i Main Menu"}
