@@ -130,14 +130,22 @@ class Manager:
                 if self.prompts.get(name) is p:
                     del self.prompts[name]
 
+    def viewer_watching_any(self, within: float = 3.0) -> bool:
+        """Is anybody looking at the viewer at all (any session, or none)?"""
+        now = time.monotonic()
+        return any(now - t < within for t in list(self.viewer_seen.values()))
+
     def open_prompt(self, name: str) -> dict | None:
-        p = self.prompts.get(name)
+        """The prompt for this session, else any open prompt (host-server
+        connections have no screen of their own)."""
+        with self.lock:
+            p = self.prompts.get(name) or next(iter(self.prompts.values()), None)
         return {"id": p["id"], "label": p["label"]} if p else None
 
-    def answer_prompt(self, name: str, pid: str, value: str | None) -> bool:
+    def answer_prompt(self, name: str | None, pid: str, value: str | None) -> bool:
         with self.lock:
-            p = self.prompts.get(name)
-            if not p or p["id"] != pid:
+            p = next((q for q in self.prompts.values() if q["id"] == pid), None)
+            if not p:
                 return False
             p["value"], p["cancelled"] = value, value is None
             p["event"].set()

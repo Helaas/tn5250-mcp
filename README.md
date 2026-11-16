@@ -4,6 +4,9 @@ An MCP server that lets an AI agent drive IBM i (AS/400) 5250 green-screen
 sessions: data entry, automated testing, navigating menus. It ships with a live
 web viewer, so a person can watch, sign on, or take over at any time.
 
+With a jt400 jar (JTOpen) it can also query Db2 for i with SQL and read and
+write IFS files through the IBM i host servers.
+
 Procedures you use often can be written down as **screen flows** in YAML.
 Each flow becomes an MCP tool with checked parameters, and the same files run
 from a CLI, from Python and from pytest, so they also work as tests in CI.
@@ -35,7 +38,8 @@ git clone https://github.com/Helaas/tn5250-mcp && cd tn5250-mcp
 python3 -m venv .venv && .venv/bin/pip install -e .
 ```
 
-Python 3.11+. Dependencies: the official `mcp` SDK (2.x) and PyYAML.
+Python 3.11+. Dependencies: the official `mcp` SDK (2.x) and PyYAML. For the
+optional SQL/IFS tools: Java 11+ and a JTOpen `jt400.jar` (see below).
 
 ## Hook it up
 
@@ -74,6 +78,11 @@ claude mcp add --transport http tn5250 http://127.0.0.1:8250/mcp
 | `record_start`, `record_stop` | record a session's key presses as a new flow |
 | `disconnect` | sign off from the screen's command line, then close (`signoff: false` to skip) |
 | `get_session_log` | the session's transcript (passwords masked), also after a disconnect |
+| `host_connect`, `host_disconnect` | open a SQL/IFS connection (with `--jt400`) |
+| `sql_query` | run a query; the connection is read-only on the server side |
+| `sql_execute` | change data (only with `--allow-sql-write`) |
+| `ifs_list`, `ifs_read` | list folders, read stream files (text in their CCSID, or base64) |
+| `ifs_write` | write stream files (only inside `--ifs-write-root` folders) |
 | `list_sessions`, `keys` | housekeeping |
 | *your flows* | one tool per screen flow loaded with `--flows` |
 
@@ -85,6 +94,52 @@ Example `press` call:
 { "key": "Enter", "expect": "1:WORK WITH DATA IN A FILE",
   "values": { "ID": "3", "NAME": "SPROCKET", "QTY": "-3" } }
 ```
+
+## SQL and IFS (host servers)
+
+Besides the screen, IBM i offers its data through the *host servers*:
+the database server (SQL) and the file server (IFS). tn5250-mcp uses them
+through the IBM Toolbox for Java, which **you supply**:
+
+1. Get **JTOpen**, the open-source Toolbox (IBM Public License 1.0), as
+   `jt400.jar`: from [GitHub](https://github.com/IBM/JTOpen/releases) or Maven
+   Central (`net.sf.jt400:jt400`). Don't take the copy inside IBM i Access
+   Client Solutions: its licence doesn't allow using its parts on their own.
+2. Have Java 11 or newer (`brew install openjdk@21`). It's found by itself, or
+   pass `--java`.
+3. Start the server with `--jt400 /path/to/jt400.jar`.
+
+```sh
+tn5250-mcp --jt400 ~/lib/jt400.jar --profiles profiles.yaml \
+           --ifs-write-root /home/MYUSER/out          # optional: allow ifs_write here
+           # --allow-sql-write                        # optional: allow sql_execute
+```
+
+The agent calls `host_connect` (with a profile, whose `user` key names the
+user profile, or with `host` and `user`), then `sql_query`, `ifs_list` or
+`ifs_read`. The password is typed in the viewer, or comes from
+`$T5250_PASSWORD` when nobody has the viewer open (CI). The agent never sees
+it.
+
+- `sql_query` runs on a connection the database server keeps read-only
+  (`access=read only`), so even a statement that slips past every other check
+  can't change data. It supports `?` parameter markers, a row limit, and
+  output as a table or as JSON. Naming is system naming: `MYLIB/TABLE` or
+  `MYLIB.TABLE`, plus the library list. QSYS2 services work too, for example
+  `QSYS2.ACTIVE_JOB_INFO` or `QSYS2.IFS_OBJECT_STATISTICS`.
+- `sql_execute` (INSERT, UPDATE, DELETE, CREATE, CALL, ...) is offered only with
+  `--allow-sql-write`.
+- `ifs_read` converts text from the file's CCSID; `binary: true` returns
+  base64. `ifs_write` creates new files tagged with the CCSID you give (1208 =
+  UTF-8 by default, 37 = EBCDIC US), refuses to replace a file unless
+  `overwrite` or `append` is set, and is offered only with `--ifs-write-root`.
+  It never writes outside those folders, and `..` isn't accepted.
+- SQL text and write paths go through the block list (`QCMDEXC`, `DROP
+  SCHEMA`, ...). The transcript (`get_session_log` with session `host-main`)
+  records statements and file names, not file contents.
+- The work is done by a small Java helper, shipped as source and run straight
+  from it (no build step), which talks JSON to the server. In Python:
+  `HostServers("jt400.jar").connect(...)`, `.query(...)`, `.ifs_read(...)`.
 
 ## Connection profiles
 
@@ -108,7 +163,7 @@ profiles:
 ```
 
 Keys: `host` (required), `description`, `port`, `tls`, `verify_tls`,
-`device_name`, `wide`, `codepage`, `after_connect` (a flow name, or `{flow,
+`device_name`, `wide`, `codepage`, `user` (for `host_connect`), `after_connect` (a flow name, or `{flow,
 with}`), `on_reconnect`. Profiles never hold passwords; a file with a
 `password` key is refused. Use a sign-on flow as `after_connect`: it asks for
 the password in the viewer, or reads it from the environment.
@@ -381,6 +436,10 @@ listens on 127.0.0.1 and needs the random token, and it checks the Host header.
 | `--record-dir DIR` | `T5250_RECORD_DIR` | recordings are returned, not saved |
 | `--profiles PATH` (repeatable) | `T5250_PROFILES` (`:`-separated) | none |
 | `--profiles-only` | `T5250_PROFILES_ONLY=1` | off |
+| `--jt400 PATH` | `T5250_JT400` | no SQL/IFS tools |
+| `--java PATH` | `T5250_JAVA` | found automatically (Java 11+) |
+| `--allow-sql-write` | `T5250_ALLOW_SQL_WRITE=1` | off |
+| `--ifs-write-root DIR` (repeatable) | `T5250_IFS_WRITE_ROOT` (`:`-separated) | no `ifs_write` |
 
 ## Examples and tests
 

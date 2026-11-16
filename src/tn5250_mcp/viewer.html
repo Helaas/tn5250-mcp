@@ -290,9 +290,8 @@ async function answerPrompt(cancel) {
   const id = promptId, value = $("pwValue").value;
   $("pwValue").value = "";
   promptId = null; $("pw").close();
-  if (!id || !current) return;
-  const r = await api("/api/secret", cancel ? {session: current.session, id, cancel: true}
-                                             : {session: current.session, id, value});
+  if (!id) return;
+  const r = await api("/api/secret", cancel ? {id, cancel: true} : {id, value});
   if (!r.ok) $("msg").textContent = r.error;
 }
 // Only send what a person typed or pasted: auto-filled values (no real key presses) are

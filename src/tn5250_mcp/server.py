@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import inspect
+import json
 import os
 import sys
 from typing import Annotated, Any
@@ -16,6 +17,7 @@ from pydantic import Field
 
 from .flows import Flow, FlowConfigError, FlowError, FlowRunner, FlowSet
 from .guard import DEFAULT_BLOCKED, Guard
+from .hostservers import HostServerError, HostServers, format_table
 from .manager import GuardError, Manager, render
 from .profiles import ProfileError, ProfileSet
 from .session import ALL_KEYS
@@ -24,6 +26,9 @@ INSTRUCTIONS = """\
 Drive IBM i (AS/400) 5250 green-screen sessions.
 
 Workflow: connect -> get_screen -> fill / press -> read the screen that press returns.
+- SQL and IFS tools (sql_query, ifs_list, ifs_read, ...), when offered, work
+  through the IBM i host servers, not the screen: host_connect first. They
+  are faster and exact for reading data; use the screen for applications.
 - connect with a saved profile ({"profile": name}; list_profiles shows them) when
   there are any; a profile may sign on by itself after connecting.
 - Every fill/press must carry `expect` (text that must be on the current screen,
@@ -52,9 +57,13 @@ Workflow: connect -> get_screen -> fill / press -> read the screen that press re
 
 BUILTIN_TOOLS = {"connect", "disconnect", "list_sessions", "get_screen", "fill", "press",
                  "wait", "viewer", "keys", "record_start", "record_stop", "list_profiles",
-                 "get_session_log"}
+                 "get_session_log", "host_connect", "host_disconnect", "sql_query",
+                 "sql_execute", "ifs_list", "ifs_read", "ifs_write"}
 
 Session_ = Annotated[str, Field(description="session name; lets you run several side by side")]
+Conn_ = Annotated[str, Field(description="name of the host-server connection")]
+Params_ = Annotated[list[str | int | float | None] | None, Field(
+    description="values for ? parameter markers, in order")]
 
 
 def _flow_annotation(p) -> Any:
@@ -108,7 +117,8 @@ def _flow_description(f: Flow, flows: FlowSet) -> str:
 def build_server(mgr: Manager, flows: FlowSet | None = None,
                  toolsets: list[str] | None = None, flows_only: bool = False,
                  read_only: bool = False, pace: float = 0.0,
-                 profiles: ProfileSet | None = None, profiles_only: bool = False) -> MCPServer:
+                 profiles: ProfileSet | None = None, profiles_only: bool = False,
+                 hostservers: HostServers | None = None) -> MCPServer:
     mcp = MCPServer("tn5250", instructions=INSTRUCTIONS, version="0.4.0")
     flows = flows if flows is not None else FlowSet()
     runner = FlowRunner(mgr, flows, pace=pace)
@@ -119,7 +129,7 @@ def build_server(mgr: Manager, flows: FlowSet | None = None,
     async def run(fn, *a, **k):
         try:
             return await anyio.to_thread.run_sync(lambda: fn(*a, **k))
-        except (GuardError, FlowError, ProfileError) as e:
+        except (GuardError, FlowError, ProfileError, HostServerError) as e:
             raise ToolError(str(e)) from None
         except (OSError, ConnectionError) as e:
             raise ToolError("connection problem: %s" % e) from None
@@ -352,11 +362,166 @@ def build_server(mgr: Manager, flows: FlowSet | None = None,
 
     for f in flows.select(toolsets, read_only, allow_secrets=bool(mgr.viewer_url)):
         _add_flow_tool(mcp, f, flows, runner, run)
+    if hostservers is not None:
+        _add_host_tools(mcp, mgr, hostservers, profiles, profiles_only, read_only, run)
     # recordings saved from the viewer become tools too (clients see them on their
     # next tool listing)
     mgr.on_recorded = lambda text: _register_recorded(mcp, flows, runner, run, text, toolsets,
                                                       flows_only, read_only)
     return mcp
+
+
+def _host_password(mgr: Manager, name: str, user: str, host: str) -> str:
+    """Password for a host-server connection: typed in the viewer when somebody
+    has it open, else $T5250_PASSWORD; never from the agent."""
+    if mgr.viewer_url and mgr.viewer_watching_any():
+        return mgr.ask_secret("host:" + name, "IBM i password for %s on %s" % (user, host))
+    if os.environ.get("T5250_PASSWORD"):
+        return os.environ["T5250_PASSWORD"]
+    if mgr.viewer_url:
+        raise HostServerError("the password for %s is typed by a person: give the user the "
+                              "viewer link (%s), ask them to keep it open, then call "
+                              "host_connect again" % (user, mgr.viewer_url))
+    raise HostServerError("no password: set $T5250_PASSWORD, or run with the viewer on")
+
+
+def _add_host_tools(mcp: MCPServer, mgr: Manager, hs: HostServers, profiles: ProfileSet,
+                    profiles_only: bool, read_only: bool, run) -> None:
+    """SQL and IFS through the IBM i host servers (jt400)."""
+    loggers: dict = {}
+
+    def log(name, kind, text):
+        if name not in loggers:
+            loggers[name] = mgr._logger("host-" + name)
+        loggers[name](kind, text)
+    hs.log = log
+
+    @mcp.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False,
+                                          open_world_hint=True))
+    async def host_connect(
+        profile: Annotated[str | None, Field(
+            description="saved connection profile (uses its host, TLS and user)")] = None,
+        host: Annotated[str | None, Field(description="IBM i host, when not using a profile")]
+        = None,
+        user: Annotated[str | None, Field(description="user profile")] = None,
+        tls: Annotated[bool | None, Field(description="TLS (default true)")] = None,
+        name: Conn_ = "main",
+    ) -> str:
+        """Open a connection to the IBM i database and file servers for the SQL
+        and IFS tools. The user types the password in the viewer (give them
+        the viewer link first); you never see it."""
+        if profile:
+            p = await run(profiles.get, profile)
+            if host:
+                raise ToolError("connect with either a profile or a host, not both")
+            host, use_tls = p.host, p.tls
+            user = user or p.user
+        else:
+            if profiles_only:
+                raise ToolError("this server only connects through saved profiles: %s"
+                                % (", ".join(profiles.profiles) or "none configured"))
+            use_tls = True if tls is None else tls
+        if not host or not user:
+            raise ToolError("host_connect needs a host and a user (or a profile with a user)")
+        pw = await run(_host_password, mgr, name, user, host)
+        info = await run(hs.connect, name, host, user, pw, use_tls)
+        del pw
+        return "connected %s: %s on %s (%s, %s); jt400 %s" % (
+            name, info["user"], info["host"], info["release"], "TLS" if use_tls else "plain",
+            hs.helper.version)
+
+    @mcp.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False,
+                                          idempotent_hint=True))
+    async def host_disconnect(name: Conn_ = "main") -> str:
+        """Close a host-server connection."""
+        await run(hs.disconnect, name)
+        return "closed %s" % name
+
+    @mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True))
+    async def sql_query(
+        sql: Annotated[str, Field(description="SELECT / WITH / VALUES; system naming "
+                                              "(MYLIB/TABLE or MYLIB.TABLE), ? markers")],
+        params: Params_ = None,
+        max_rows: Annotated[int, Field(ge=1, le=1000)] = 100,
+        format: Annotated[str, Field(description="table or json")] = "table",
+        name: Conn_ = "main",
+    ) -> str:
+        """Run a query on the IBM i database (Db2 for i). The connection is
+        read-only on the server side, so statements that change data fail.
+        QSYS2 services are available too (e.g. QSYS2.ACTIVE_JOB_INFO,
+        QSYS2.IFS_OBJECT_STATISTICS)."""
+        res = await run(hs.query, name, sql, params, max_rows)
+        if format == "json":
+            return json.dumps(res, ensure_ascii=False)
+        return format_table(res)
+
+    if hs.allow_sql_write and not read_only:
+        @mcp.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=True,
+                                              open_world_hint=True))
+        async def sql_execute(
+            sql: Annotated[str, Field(description="INSERT, UPDATE, DELETE, CREATE, CALL ...")],
+            params: Params_ = None,
+            name: Conn_ = "main",
+        ) -> str:
+            """Run a statement that changes data (autocommit). Checked against the
+            block list."""
+            res = await run(hs.execute, name, sql, params)
+            return format_table(res)
+
+    @mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True))
+    async def ifs_list(
+        path: Annotated[str, Field(description="absolute IFS path, e.g. /home/MYUSER")],
+        name: Conn_ = "main",
+    ) -> str:
+        """List an IFS directory (or describe one file)."""
+        res = await run(hs.ifs_list, name, path)
+        lines = ["%s%s" % (res["path"], " (directory)" if res["dir"] else "")]
+        for e in res["entries"]:
+            lines.append("  %-40s %s" % (e["name"] + ("/" if e["dir"] else ""),
+                                         "" if e["dir"] else "%d bytes" % e["size"]))
+        if res.get("truncated"):
+            lines.append("  ... more entries not shown")
+        return "\n".join(lines)
+
+    @mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True))
+    async def ifs_read(
+        path: Annotated[str, Field(description="absolute IFS path of a stream file")],
+        max_bytes: Annotated[int, Field(ge=1, le=1_000_000)] = 100_000,
+        binary: Annotated[bool, Field(description="return base64 instead of text")] = False,
+        name: Conn_ = "main",
+    ) -> str:
+        """Read a stream file from the IFS. Text is converted from the file's
+        CCSID; binary content comes back as base64."""
+        res = await run(hs.ifs_read, name, path, max_bytes, binary)
+        head = "%s: %d bytes, CCSID %s%s\n" % (path, res["size"], res["ccsid"],
+                                               ", truncated" if res["truncated"] else "")
+        return head + (res["base64"] if binary else res["text"])
+
+    if hs.ifs_write_roots and not read_only:
+        async def ifs_write(
+            path: Annotated[str, Field(description="absolute IFS path inside an allowed "
+                                                   "folder (see the tool description)")],
+            content: Annotated[str, Field(description="text, or base64 when binary")],
+            binary: bool = False,
+            ccsid: Annotated[int, Field(description="CCSID for a new text file "
+                                                    "(1208 = UTF-8, 37 = EBCDIC US)")] = 1208,
+            overwrite: bool = False,
+            append: bool = False,
+            name: Conn_ = "main",
+        ) -> str:
+            """Write a stream file to the IFS (only inside the folders the server
+            allows). Refuses to replace an existing file unless overwrite or
+            append is set."""
+            res = await run(hs.ifs_write, name, path, content, binary=binary, ccsid=ccsid,
+                            overwrite=overwrite, append=append)
+            return "wrote %s: %d bytes, CCSID %s" % (res["path"], res["size"], res["ccsid"])
+
+        mcp.add_tool(ifs_write, description=(
+            "Write a stream file to the IFS, only inside: %s. Refuses to replace an existing "
+            "file unless overwrite or append is set. Text is written in the given CCSID "
+            "(1208 = UTF-8)." % ", ".join(hs.ifs_write_roots)),
+            annotations=ToolAnnotations(read_only_hint=False, destructive_hint=True,
+                                        open_world_hint=True))
 
 
 def _register_recorded(mcp, flows: FlowSet, runner: FlowRunner, run, text: str,
@@ -439,6 +604,17 @@ def main(argv: list[str] | None = None) -> None:
                    default=[x for x in os.environ.get("T5250_PROFILES", "").split(os.pathsep)
                             if x],
                    help="YAML file or folder of saved connection profiles (repeatable)")
+    p.add_argument("--jt400", default=os.environ.get("T5250_JT400"),
+                   help="path to jt400.jar (JTOpen) to enable the SQL and IFS tools")
+    p.add_argument("--java", default=os.environ.get("T5250_JAVA"),
+                   help="Java 11+ runtime for the jt400 helper (default: found automatically)")
+    p.add_argument("--allow-sql-write", action="store_true",
+                   default=os.environ.get("T5250_ALLOW_SQL_WRITE") == "1",
+                   help="offer sql_execute (statements that change data)")
+    p.add_argument("--ifs-write-root", action="append",
+                   default=[x for x in os.environ.get("T5250_IFS_WRITE_ROOT", "").split(
+                       os.pathsep) if x],
+                   help="offer ifs_write, limited to this IFS folder (repeatable)")
     p.add_argument("--profiles-only", action="store_true",
                    default=os.environ.get("T5250_PROFILES_ONLY") == "1",
                    help="connect only through saved profiles (no free host names)")
@@ -484,12 +660,17 @@ def main(argv: list[str] | None = None) -> None:
     toolsets = [t.strip() for t in a.toolsets.split(",") if t.strip()] or None
     try:
         profileset = ProfileSet.load(a.profiles) if a.profiles else None
+        hostservers = None
+        if a.jt400:
+            hostservers = HostServers(a.jt400, a.java, allow_sql_write=a.allow_sql_write,
+                                      ifs_write_roots=a.ifs_write_root, guard=guard)
+            print("tn5250-mcp: SQL/IFS tools on (%s)" % a.jt400, file=sys.stderr)
         server = build_server(mgr, flowset, toolsets, a.flows_only, a.read_only, a.pace,
-                              profileset, a.profiles_only)
+                              profileset, a.profiles_only, hostservers)
         if profileset:
             profileset.validate_flows(flowset, mgr.flow_runner)
             print("tn5250-mcp: profiles: %s" % ", ".join(profileset.profiles), file=sys.stderr)
-    except (FlowConfigError, ProfileError) as e:
+    except (FlowConfigError, ProfileError, HostServerError) as e:
         p.exit(2, "tn5250-mcp: %s\n" % e)
     if flowset:
         offered = [f.name for f in flowset.select(toolsets, a.read_only,

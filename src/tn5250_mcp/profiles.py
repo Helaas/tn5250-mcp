@@ -32,7 +32,7 @@ import yaml
 from .flows import NAME_RE, FlowConfigError, FlowSet
 
 PROFILE_KEYS = {"description", "host", "port", "tls", "verify_tls", "device_name", "wide",
-                "codepage", "after_connect", "on_reconnect"}
+                "codepage", "after_connect", "on_reconnect", "user"}
 _SECRET_KEYS = {"password", "passwd", "pwd", "secret", "token"}
 _DEVNAME = re.compile(r"^[A-Z#$@][A-Z0-9#$@_]{0,9}$")
 _LETTERS = string.ascii_uppercase
@@ -55,6 +55,7 @@ class Profile:
     codepage: str | None = None
     after_connect: dict | None = None   # {"flow": name, "with": {...}}
     on_reconnect: bool = False          # run after_connect again after a reconnect
+    user: str | None = None             # user profile for SQL/IFS (host servers)
     source: str = ""
     _seq: Any = field(default=None, repr=False)
 
@@ -130,6 +131,10 @@ def parse_profile(name: str, spec: Any, source: str) -> Profile:
                 port=port, tls=tls, verify_tls=_bool(spec, "verify_tls", True, where),
                 wide=_bool(spec, "wide", False, where),
                 on_reconnect=_bool(spec, "on_reconnect", False, where), source=source)
+    if spec.get("user") is not None:
+        if not re.fullmatch(r"[A-Za-z#$@][A-Za-z0-9#$@_]{0,9}", str(spec["user"])):
+            raise ProfileError("%s: user %r is not a user profile name" % (where, spec["user"]))
+        p.user = str(spec["user"]).upper()
     if spec.get("device_name") is not None:
         try:
             p.device_name = check_device_name(str(spec["device_name"]))

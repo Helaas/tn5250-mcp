@@ -93,8 +93,10 @@ def start_viewer(mgr: Manager, port: int) -> str:
             elif u.path == "/api/state":
                 name = parse_qs(u.query).get("session", [""])[0]
                 names = list(mgr.sessions)
+                mgr.viewer_seen["*"] = time.monotonic()      # somebody has the viewer open
                 if not names:
-                    return self._json({"sessions": [], "screen": None, "v": version})
+                    return self._json({"sessions": [], "screen": None, "v": version,
+                                       "prompt": mgr.open_prompt("")})
                 s = mgr.sessions.get(name) or mgr.sessions[names[0]]
                 mgr.viewer_seen[s.name] = time.monotonic()
                 with s.cond:
@@ -114,6 +116,11 @@ def start_viewer(mgr: Manager, port: int) -> str:
             try:
                 n = int(self.headers.get("Content-Length", "0"))
                 req = json.loads(self.rfile.read(n) or b"{}")
+                if u.path == "/api/secret":           # may belong to no 5250 session
+                    ok = mgr.answer_prompt(None, str(req.get("id", "")),
+                                           None if req.get("cancel") else str(req.get("value", "")))
+                    return self._json({"ok": ok} if ok else {
+                        "ok": False, "error": "that prompt is no longer open"}, 200 if ok else 409)
                 s = mgr.get(req.get("session", ""))
                 if u.path == "/api/record/start":
                     mgr.record_start(s)
@@ -126,12 +133,6 @@ def start_viewer(mgr: Manager, port: int) -> str:
                     tool = bool(text and mgr.on_recorded and mgr.on_recorded(text))
                     self._json({"ok": True, "yaml": text, "path": path, "tool": tool,
                                 "record_dir": mgr.record_dir})
-                elif u.path == "/api/secret":
-                    ok = mgr.answer_prompt(s.name, str(req.get("id", "")),
-                                           None if req.get("cancel") else str(req.get("value", "")))
-                    self._json({"ok": ok} if ok else {"ok": False,
-                                                       "error": "that prompt is no longer open"},
-                               200 if ok else 409)
                 elif u.path == "/api/reconnect":
                     if s.connected or s.reconnecting:
                         return self._json({"ok": True})
