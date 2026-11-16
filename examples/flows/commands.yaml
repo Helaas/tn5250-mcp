@@ -1,0 +1,41 @@
+# Command tools: CL commands with typed parameters that become tools of their
+# own. Use them for the commands a shop already builds and deploys with (its
+# own compile or promotion commands, a change-management tool's, a build CL
+# program), so the agent goes through those instead of compiling directly.
+#
+# Needs --jt400 and --allow-commands; every command (and the command SBMJOB
+# submits) still goes through --command-allow and the block list.
+#
+# Values go into the command as CL tokens: name-like characters only, unless
+# the parameter says quote: true (then it goes in as 'text', quotes doubled).
+
+toolset: build
+commands:
+  batch_compile_rpg:
+    description: >-
+      Compile an RPGLE source member into a program in a batch job (SBMJOB
+      CRTBNDRPG), wait until the job has ended, and return the errors from
+      its compile listing with line numbers, plus the job log's messages.
+    params:
+      lib: {type: string, upper: true, pattern: '^[A-Z$#@][A-Z0-9_$#@]{0,9}$',
+            description: "library of the source file; the program is created here too"}
+      file: {type: string, upper: true, pattern: '^[A-Z$#@][A-Z0-9_$#@]{0,9}$',
+             default: QRPGLESRC}
+      member: {type: string, upper: true, pattern: '^[A-Z$#@][A-Z0-9_$#@]{0,9}$'}
+    command: >-
+      SBMJOB CMD(CRTBNDRPG PGM({lib}/{member}) SRCFILE({lib}/{file}) SRCMBR({member})
+      DBGVIEW(*SOURCE)) JOB({member}) MSGQ(*NONE)
+    wait: true
+    timeout: 600
+    delete_spooled: true         # the listing and job log were read; don't leave them
+
+  # The same idea for a shop's own build command, e.g.:
+  #
+  # shop_build:
+  #   description: Build a member through the change-management tool
+  #   params:
+  #     member: {type: string, upper: true, pattern: '^[A-Z$#@][A-Z0-9_$#@]{0,9}$'}
+  #     note: {type: string, quote: true, default: ""}
+  #   libl: [TOOLLIB, MYLIB, QGPL]
+  #   command: MYBUILD MBR({member}) TEXT({note})
+  #   wait: true                 # when MYBUILD submits the compile (CPC1221)

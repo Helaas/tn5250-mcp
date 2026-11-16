@@ -146,7 +146,7 @@ def test_job_log_and_spooled_files(hs):
     with pytest.raises(HostServerError, match="number/user/name"):
         hs.job_log("main", job="QZRCSRVS")
     listed = hs.spooled_files("main")["rows"][0]
-    assert listed == ["QPRTLIBL", "1", "654322/BOB/QPRTJOB"]
+    assert listed[:3] == ["QPRTLIBL", "1", "654322/BOB/QPRTJOB"]
     assert hs.spooled_file("main", listed[2], "QPRTLIBL")["lines"][-1] == "TOTAL 42"
     with pytest.raises(HostServerError, match="no spooled file QPRTLIBL.*QPRTJOB"):
         hs.spooled_file("main", "654321/QUSER/QZRCSRVS", "QPRTLIBL")

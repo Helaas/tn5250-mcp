@@ -336,9 +336,6 @@ def compile_options(p: Project, t: Target) -> str:
     return opts.strip()
 
 
-_SQLMSG = re.compile(r"^([A-Z]{2,3}[0-9A-F]{4,5})\s+(\d+)\s+(\d+)\s+(.*)$")
-
-
 def sql_errors(hs, name: str, t: Target, path: str) -> list[dict]:
     """RUNSQLSTM's errors from its listing (its spooled file, named after the
     source, in the user's QPRTJOB job), which is then deleted."""
@@ -354,20 +351,9 @@ def sql_errors(hs, name: str, t: Target, path: str) -> list[dict]:
                         None)
     except HostServerError:
         return []
-    out = []
-    for line in lines:
-        m = _SQLMSG.match(line.strip())
-        if not m:
-            continue
-        text = m.group(4).strip()
-        pos = re.match(r"Position (\d+)\s+(.*)", text)
-        sev = int(m.group(2))
-        out.append({"file": path, "line": int(m.group(3)), "column": int(pos.group(1)) if pos
-                    else 1, "severity": sev,
-                    "severity_name": "info" if sev < 10 else "warning" if sev < 20 else
-                    "error" if sev < 30 else "severe" if sev < 40 else "terminal",
-                    "id": m.group(1), "text": pos.group(2) if pos else text})
-    return out
+    from .listings import parse_listing
+    return [dict({k: v for k, v in d.items() if k != "seq"}, file=path)
+            for d in parse_listing(lines)["diagnostics"]]
 
 
 def load_state(p: Project) -> dict:

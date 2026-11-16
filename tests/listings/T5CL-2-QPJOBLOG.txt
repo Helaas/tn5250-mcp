@@ -1,0 +1,69 @@
+ 5770SS1 V7R5M0 220415                           Job Log                            MYSYS    26-11-16  22:01:38 UTC     Page    1
+  Job name . . . . . . . . . . :   T5CL            User  . . . . . . :   ME          Number . . . . . . . . . . . :   432262
+  Job description  . . . . . . :   ME             Library . . . . . :   QGPL
+MSGID      TYPE                    SEV  DATE      TIME             FROM PGM     LIBRARY     INST     TO PGM      LIBRARY     INST
+CPF1124    Information             00   26-11-16  22:01:38.030626  QWTPIIPP     QSYS        04DC     *EXT                    *N
+                                     Message . . . . :   Job 432262/ME/T5CL started on 26-11-16 at 22:01:38 in
+                                       subsystem QBATCH in QSYS. Job entered system on 26-11-16 at 22:01:37.
+CPI1125    Information             00   26-11-16  22:01:38.030778  QWTPCRJA     QSYS        0110     *EXT                    *N
+                                     Message . . . . :   Job 432262/ME/T5CL submitted.
+                                     Cause . . . . . :   Job 432262/ME/T5CL submitted to job queue ME in QGPL
+                                       from job 430526/QUSER/QZRCSRVS. Job 432262/ME/T5CL was started using the
+                                       Submit Job (SBMJOB) command with the following job attributes: JOBPTY(5)
+                                       OUTPTY(5) PRTTXT(-=* https://example.com *=-) RTGDTA(QCMDB) SYSLIBL(MYSYSSYS
+                                        QSYS       QSYS2      QUSRSYS    QHLPSYS) CURLIB(MYLIB) INLLIBL(MYLIB)
+                                       INLASPGRP(*NONE) LOG(4 00 *SECLVL) LOGCLPGM(*YES) LOGOUTPUT(*JOBEND)
+                                       OUTQ(QGPL/ME) PRTDEV(PRT01) INQMSGRPY(*RQD) HOLD(*NO) DATE(*SYSVAL)
+                                       SWS(00000000)  MSGQ(/*NONE) CCSID(273) SRTSEQ(*N/*HEX) LANGID(ENU)
+                                       CNTRYID(US) JOBMSGQMX(64) JOBMSGQFL(*PRTWRAP) ALWMLTTHD(*NO)
+                                       SPLFACN(*DETACH) ACGCDE().
+*NONE      Request                      26-11-16  22:01:38.030910  QWTSCSBJ                 *N       QCMD        QSYS        0195
+                                     Message . . . . :  -CRTBNDCL PGM(MYLIB/T5CL) SRCFILE(MYLIB/T5250SRC)
+                                       SRCMBR(T5CL)
+CPF0820    Escape                  40   26-11-16  22:01:38.040897  QCLENTR      QSYS        040D     QCMD        QSYS        01C8
+                                     Message . . . . :   Program T5CL not created.
+                                     Cause . . . . . :   Program T5CL was not created in library MYLIB because of
+                                       errors in compiling.  See messages in the computer printout of the control
+                                       language (CL) compiler and any previously listed messages. Recovery  . . . :
+                                         Correct the errors, then try the CRTBNDCL command again. If your program
+                                       uses the CALLPRC command to call another ILE procedure, you may have to use
+                                       the Create CL Module (CRTCLMOD) command instead of CRTBNDCL.  Then use the
+                                       Create Program (CRTPGM) command to create a program using the module you
+                                       created and the module containing the procedure that you want to call.
+                                       Technical description . . . . . . . . :   The Create Bound CL Program
+                                       (CRTBNDCL) command allows you to create with a single command an ILE CL
+                                       program which does not call any other ILE procedures. Using the Create CL
+                                       Module (CRTCLMOD) command followed by the Create Program (CRTPGM) command
+                                       will give you the same results. You must use CRTCLMOD and CRTPGM instead of
+                                       CRTBNDCL if you want to bind other ILE procedures with the CL module you are
+                                       creating.
+CPC2402    Completion              50   26-11-16  22:01:38.041605  QCMD         QSYS        066F     *EXT                    *N
+                                     Message . . . . :   Job ended. Cancel message received at command processor.
+                                     Cause . . . . . :   A message with a severity equal to or exceeding the end
+                                       severity was received at the command processor. Recovery  . . . :   See the
+                                       messages previously listed to determine the message that caused the job to
+                                       be ended. Correct the errors, and then try the request again.
+CPF1164    Completion              00   26-11-16  22:01:38.042077  QWTMCEOJ     QSYS        0161     *EXT                    *N
+                                     Message . . . . :   Job 432262/ME/T5CL ended on 26-11-16 at 22:01:38; .005
+                                       seconds used; end code 20 .
+                                     Cause . . . . . :   Job 432262/ME/T5CL completed on 26-11-16 at 22:01:38
+                                       after it used .005 seconds processing unit time. The maximum temporary
+                                       storage used was 7 megabytes. The job had ending code 20. The job ended
+                                       after 1 routing steps with a secondary ending code of 0.  The job ending
+                                       codes and their meanings are as follows:  0 - The job completed normally. 10
+                                       - The job completed normally during controlled ending or controlled
+                                       subsystem ending. 20 - The job exceeded end severity (ENDSEV job attribute).
+                                       30 - The job ended abnormally. 40 - The job ended before becoming active. 50
+                                                   -=* https://example.com *=-
+ 5770SS1 V7R5M0 220415                           Job Log                            MYSYS    26-11-16  22:01:38 UTC     Page    2
+  Job name . . . . . . . . . . :   T5CL            User  . . . . . . :   ME          Number . . . . . . . . . . . :   432262
+  Job description  . . . . . . :   ME             Library . . . . . :   QGPL
+MSGID      TYPE                    SEV  DATE      TIME             FROM PGM     LIBRARY     INST     TO PGM      LIBRARY     INST
+                                       - The job ended while the job was active. 60 - The subsystem ended
+                                       abnormally while the job was active. 70 - The system ended abnormally while
+                                       the job was active. 80 - The job ended (ENDJOBABN command). 90 - The job was
+                                       forced to end after the time limit ended (ENDJOBABN command). Recovery  . .
+                                       . :   For more information, see the Work management topic collection in the
+                                       Systems management category in the IBM i Information Center,
+                                       http://www.ibm.com/systems/i/infocenter/.
+                                                   -=* https://example.com *=-

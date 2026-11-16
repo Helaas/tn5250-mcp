@@ -1,0 +1,63 @@
+ 5770SS1 V7R5M0 220415                           Job Log                            MYSYS    26-11-16  22:01:38 UTC     Page    1
+  Job name . . . . . . . . . . :   T5PF            User  . . . . . . :   ME          Number . . . . . . . . . . . :   432266
+  Job description  . . . . . . :   ME             Library . . . . . :   QGPL
+MSGID      TYPE                    SEV  DATE      TIME             FROM PGM     LIBRARY     INST     TO PGM      LIBRARY     INST
+CPF1124    Information             00   26-11-16  22:01:38.888697  QWTPIIPP     QSYS        04DC     *EXT                    *N
+                                     Message . . . . :   Job 432266/ME/T5PF started on 26-11-16 at 22:01:38 in
+                                       subsystem QBATCH in QSYS. Job entered system on 26-11-16 at 22:01:38.
+CPI1125    Information             00   26-11-16  22:01:38.888850  QWTPCRJA     QSYS        0110     *EXT                    *N
+                                     Message . . . . :   Job 432266/ME/T5PF submitted.
+                                     Cause . . . . . :   Job 432266/ME/T5PF submitted to job queue ME in QGPL
+                                       from job 430526/QUSER/QZRCSRVS. Job 432266/ME/T5PF was started using the
+                                       Submit Job (SBMJOB) command with the following job attributes: JOBPTY(5)
+                                       OUTPTY(5) PRTTXT(-=* https://example.com *=-) RTGDTA(QCMDB) SYSLIBL(MYSYSSYS
+                                        QSYS       QSYS2      QUSRSYS    QHLPSYS) CURLIB(MYLIB) INLLIBL(MYLIB)
+                                       INLASPGRP(*NONE) LOG(4 00 *SECLVL) LOGCLPGM(*YES) LOGOUTPUT(*JOBEND)
+                                       OUTQ(QGPL/ME) PRTDEV(PRT01) INQMSGRPY(*RQD) HOLD(*NO) DATE(*SYSVAL)
+                                       SWS(00000000)  MSGQ(/*NONE) CCSID(273) SRTSEQ(*N/*HEX) LANGID(ENU)
+                                       CNTRYID(US) JOBMSGQMX(64) JOBMSGQFL(*PRTWRAP) ALWMLTTHD(*NO)
+                                       SPLFACN(*DETACH) ACGCDE().
+*NONE      Request                      26-11-16  22:01:38.889012  QWTSCSBJ                 *N       QCMD        QSYS        0195
+                                     Message . . . . :  -CRTPF FILE(MYLIB/T5PF) SRCFILE(MYLIB/T5250SRC) SRCMBR(T5PF)
+CPF7311    Diagnostic              30   26-11-16  22:01:38.892516  QDDCPF       QSYS        054C     QCMD        QSYS        01C8
+                                     Message . . . . :   Errors in DDS not allowed with specified GENLVL.
+                                     Cause . . . . . :   Either the severity level of the errors found in DDS was
+                                       greater than or equal to the error generation level (GENLVL parameter), or
+                                       GENLVL(0) was specified. Recovery  . . . :   See the DDS source listing for
+                                       the GENLVL value and error messages.  Either correct the errors or change
+                                       the GENLVL value on the command, and then try the request again.
+CPF7302    Escape                  40   26-11-16  22:01:38.896501  QDDCPF       QSYS        05CB     QCMD        QSYS        01C8
+                                     Message . . . . :   File T5PF not created in library MYLIB.
+                                     Cause . . . . . :   The file was not created because of errors. Recovery  . .
+                                       . :   See the error messages previously listed.  Correct the errors, and
+                                       then try the request again.
+CPC2402    Completion              50   26-11-16  22:01:38.897491  QCMD         QSYS        066F     *EXT                    *N
+                                     Message . . . . :   Job ended. Cancel message received at command processor.
+                                     Cause . . . . . :   A message with a severity equal to or exceeding the end
+                                       severity was received at the command processor. Recovery  . . . :   See the
+                                       messages previously listed to determine the message that caused the job to
+                                       be ended. Correct the errors, and then try the request again.
+CPF1164    Completion              00   26-11-16  22:01:38.898268  QWTMCEOJ     QSYS        0161     *EXT                    *N
+                                     Message . . . . :   Job 432266/ME/T5PF ended on 26-11-16 at 22:01:38; .005
+                                       seconds used; end code 20 .
+                                     Cause . . . . . :   Job 432266/ME/T5PF completed on 26-11-16 at 22:01:38
+                                       after it used .005 seconds processing unit time. The maximum temporary
+                                       storage used was 7 megabytes. The job had ending code 20. The job ended
+                                       after 1 routing steps with a secondary ending code of 0.  The job ending
+                                       codes and their meanings are as follows:  0 - The job completed normally. 10
+                                       - The job completed normally during controlled ending or controlled
+                                       subsystem ending. 20 - The job exceeded end severity (ENDSEV job attribute).
+                                       30 - The job ended abnormally. 40 - The job ended before becoming active. 50
+                                       - The job ended while the job was active. 60 - The subsystem ended
+                                       abnormally while the job was active. 70 - The system ended abnormally while
+                                       the job was active. 80 - The job ended (ENDJOBABN command). 90 - The job was
+                                       forced to end after the time limit ended (ENDJOBABN command). Recovery  . .
+                                       . :   For more information, see the Work management topic collection in the
+                                       Systems management category in the IBM i Information Center,
+                                                   -=* https://example.com *=-
+ 5770SS1 V7R5M0 220415                           Job Log                            MYSYS    26-11-16  22:01:38 UTC     Page    2
+  Job name . . . . . . . . . . :   T5PF            User  . . . . . . :   ME          Number . . . . . . . . . . . :   432266
+  Job description  . . . . . . :   ME             Library . . . . . :   QGPL
+MSGID      TYPE                    SEV  DATE      TIME             FROM PGM     LIBRARY     INST     TO PGM      LIBRARY     INST
+                                       http://www.ibm.com/systems/i/infocenter/.
+                                                   -=* https://example.com *=-

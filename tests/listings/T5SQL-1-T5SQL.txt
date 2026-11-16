@@ -1,0 +1,70 @@
+5770ST1 V7R5M0 220415            Create SQL ILE RPG Object         T5SQL                       26-11-16 22:01:37          Page     1
+Source type...............RPG
+Object name...............MYLIB/T5SQL
+Source file...............MYLIB/T5250SRC
+Member....................T5SQL
+To source file............QTEMP/QSQLTEMP1
+Options...................*XREF
+RPG preprocessor options..*NONE
+Listing option............*NONE
+Target release............V7R5M0
+INCLUDE file..............*SRCFILE
+Commit....................*CHG
+Allow copy of data........*OPTIMIZE
+Close SQL cursor..........*ENDACTGRP
+Allow blocking............*ALLREAD
+Delay PREPARE.............*NO
+Concurrent access
+  resolution..............*DFT
+Generation level..........10
+Printer file..............*LIBL/QSYSPRT
+Date format...............*JOB
+Date separator............*JOB
+Time format...............*HMS
+Time separator ...........*JOB
+Replace...................*YES
+Relational database.......*LOCAL
+User .....................*CURRENT
+RDB connect method........*DUW
+Default collection........*NONE
+Dynamic default
+  collection..............*NO
+Package name..............*OBJLIB/*OBJ
+Path......................*NAMING
+SQL rules.................*DB2
+Created object type.......*PGM
+Debugging view............*NONE
+Debugging encryption key..*NONE
+User profile .............*NAMING
+Dynamic user profile......*USER
+Sort sequence.............*JOB
+Language ID...............*JOB
+IBM SQL flagging..........*NOFLAG
+ANS flagging..............*NONE
+Text......................*SRCMBRTXT
+Source file CCSID.........273
+Job CCSID.................273
+Decimal result options:
+  Maximum precision.......31
+  Maximum scale...........31
+  Minimum divide scale....0
+DECFLOAT rounding mode....*HALFEVEN
+Compiler options..........*NONE
+Source member changed on 26-11-16  22:01:36
+                                                   -=* https://example.com *=-
+5770ST1 V7R5M0 220415            Create SQL ILE RPG Object         T5SQL                       26-11-16 22:01:37          Page     2
+                                             DIAGNOSTIC MESSAGES
+    3   exec sql select count(*) into :n from nosuchtab;                                                       000300   26-11-16
+                                                   -=* https://example.com *=-
+5770ST1 V7R5M0 220415            Create SQL ILE RPG Object         T5SQL                       26-11-16 22:01:37          Page     3
+                                             DIAGNOSTIC MESSAGES
+MSG ID  SEV  RECORD  TEXT
+SQL1103  10       3  Position 39 Column definitions for table NOSUCHTAB in
+                     *LIBL not found.
+                    Message Summary
+  Total     Info   Warning      Error   Severe  Terminal
+      1        0         1          0        0         0
+10 level severity errors found in source
+    5 Source records processed
+                               * * * * *  E N D  O F  L I S T I N G  * * * * *
+                                                   -=* https://example.com *=-

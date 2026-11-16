@@ -46,8 +46,37 @@ def cmd_check(a) -> int:
         return 2
     for f in fs.flows.values():
         print(f.summary() + ("" if f.expose else " (helper, not a tool)"))
-    print("%d flows OK" % len(fs.flows), file=sys.stderr)
+    for t in fs.commands.values():
+        print("%s(%s): command tool%s: %s" % (t.name, ", ".join(t.params),
+                                              ", waits for its job" if t.wait else "",
+                                              " ; ".join(t.commands)))
+    print("%d flows, %d command tools OK" % (len(fs.flows), len(fs.commands)), file=sys.stderr)
     return 0
+
+
+def cmd_tool(a) -> int:
+    from .cmdtools import result_text, run_tool
+    from .hostservers import HostServerError
+    try:
+        fs = FlowSet.load(a.flows or _env_flows())
+    except FlowConfigError as e:
+        print("invalid: %s" % e, file=sys.stderr)
+        return 2
+    t = fs.commands.get(a.tool)
+    if not t:
+        print("no command tool %r (there are: %s)" % (a.tool, ", ".join(fs.commands) or "none"),
+              file=sys.stderr)
+        return 2
+    try:
+        hs = _host(a, allow_commands=True)
+        res = run_tool(hs, "cli", t, _parse_params(a.params),
+                       say=lambda m: print(m, file=sys.stderr, flush=True))
+    except HostServerError as e:
+        print("FAILED %s" % e, file=sys.stderr)
+        return 3
+    print(json.dumps(res) if a.json else result_text(res))
+    hs.close()
+    return 0 if res["ok"] else 1
 
 
 def cmd_run(a) -> int:
@@ -436,6 +465,14 @@ def main(argv: list[str] | None = None) -> None:
     b.add_argument("--only", action="append", metavar="OBJECT", help="build just this object")
     _host_args(b)
     b.set_defaults(fn=cmd_build)
+
+    tl = sub.add_parser("tool", help="run a command tool (YAML commands:)")
+    tl.add_argument("tool")
+    tl.add_argument("params", nargs="*", metavar="name=value")
+    tl.add_argument("--flows", action="append", default=[],
+                    help="YAML file or folder (repeatable; default $T5250_FLOWS)")
+    _host_args(tl)
+    tl.set_defaults(fn=cmd_tool)
 
     sh = sub.add_parser("sh", help="run a PASE shell command; exits with its exit code")
     sh.add_argument("command")

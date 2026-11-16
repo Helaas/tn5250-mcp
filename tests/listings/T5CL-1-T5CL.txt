@@ -1,0 +1,53 @@
+ 5770SS1 V7R5M0  220415                  Control Language         MYLIB/T5CL             MYSYS 26-11-16 22:01:38         Page    1
+ Program . . . . . . . . . . . . . . . . . . . :   T5CL
+   Library . . . . . . . . . . . . . . . . . . :     MYLIB
+ Source file . . . . . . . . . . . . . . . . . :   T5250SRC
+   Library . . . . . . . . . . . . . . . . . . :     MYLIB
+ Source member name  . . . . . . . . . . . . . :   T5CL   26-11-16 22:01:37
+ Source printing options . . . . . . . . . . . :   *XREF  *NOSECLVL  *NOEVENTF  *NODOSLTLVL
+ User profile  . . . . . . . . . . . . . . . . :   *USER
+ Program logging . . . . . . . . . . . . . . . :   *JOB
+ Allow RTVCLSRC command  . . . . . . . . . . . :   *YES
+ Default activation group  . . . . . . . . . . :   *YES
+ Activation group  . . . . . . . . . . . . . . :
+ Replace program . . . . . . . . . . . . . . . :   *YES
+ Target release  . . . . . . . . . . . . . . . :   V7R5M0
+ Authority . . . . . . . . . . . . . . . . . . :   *LIBCRTAUT
+ Sort sequence . . . . . . . . . . . . . . . . :   *HEX
+ Language identifier . . . . . . . . . . . . . :   *JOBRUN
+ Text  . . . . . . . . . . . . . . . . . . . . :
+ Optimization  . . . . . . . . . . . . . . . . :   *NONE
+ Debugging view  . . . . . . . . . . . . . . . :   *STMT
+ Debug encryption key  . . . . . . . . . . . . :   *NONE
+ Enable performance collection . . . . . . . . :   *PEP
+ Storage model . . . . . . . . . . . . . . . . :   *SNGLVL
+ Compiler  . . . . . . . . . . . . . . . . . . :   IBM Control Language Compiler
+                                      Control Language Source
+ SEQNBR  *...+... 1 ...+... 2 ...+... 3 ...+... 4 ...+... 5 ...+... 6 ...+... 7 ...+... 8 ...+... 9 ...+.  DATE
+    100- PGM                                                                                              26-11-16
+    200-   DCL VAR(&X) TYPE(*CHAR) LEN(5)                                                                 26-11-16
+    300-   CHGVAR VAR(&Y) VALUE('A')                                                                      26-11-16
+* CPD0727 40  Variable &Y is referred to but not declared.
+    400-   NOSUCHCMD                                                                                      26-11-16
+* CPD0030 30  Command NOSUCHCMD in library *LIBL not found.
+    500- ENDPGM                                                                                           26-11-16
+                               * * * * *   E N D   O F   S O U R C E   * * * * *
+                                                   -=* https://example.com *=-
+ 5770SS1 V7R5M0  220415                  Control Language         MYLIB/T5CL             MYSYS 26-11-16 22:01:38         Page    2
+                                          Cross Reference
+ Declared Variables
+ Name                        Defined     Type            Length      References
+ &X                             200      *CHAR               5
+* CPD0726 10  Variable &X declared but not referred to.
+* CPD0791 00  No labels used in program.
+                     * * * * *   E N D   O F   C R O S S   R E F E R E N C E   * * * * *
+                                                   -=* https://example.com *=-
+ 5770SS1 V7R5M0  220415                  Control Language         MYLIB/T5CL             MYSYS 26-11-16 22:01:38         Page    3
+                                          Message Summary
+               Severity
+ Total         0-9  10-19  20-29  30-39  40-49  50-59  60-69  70-79  80-89  90-99
+      4          1      1      0      1      1      0      0      0      0      0
+ Program T5CL not created in library MYLIB. Maximum error severity 40.
+                               * * * * *   E N D   O F   M E S S A G E   S U M M A R Y   * * * * *
+                                 * * * * *   E N D   O F   C O M P I L A T I O N   * * * * *
+                                                   -=* https://example.com *=-

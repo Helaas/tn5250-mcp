@@ -1,0 +1,79 @@
+ 5770SS1 V7R5M0 220415                           Job Log                            MYSYS    26-11-16  22:01:36 UTC     Page    1
+  Job name . . . . . . . . . . :   T5RPG           User  . . . . . . :   ME          Number . . . . . . . . . . . :   432257
+  Job description  . . . . . . :   ME             Library . . . . . :   QGPL
+MSGID      TYPE                    SEV  DATE      TIME             FROM PGM     LIBRARY     INST     TO PGM      LIBRARY     INST
+CPF1124    Information             00   26-11-16  22:01:36.143012  QWTPIIPP     QSYS        04DC     *EXT                    *N
+                                     Message . . . . :   Job 432257/ME/T5RPG started on 26-11-16 at 22:01:36 in
+                                       subsystem QBATCH in QSYS. Job entered system on 26-11-16 at 22:01:36.
+CPI1125    Information             00   26-11-16  22:01:36.143141  QWTPCRJA     QSYS        0110     *EXT                    *N
+                                     Message . . . . :   Job 432257/ME/T5RPG submitted.
+                                     Cause . . . . . :   Job 432257/ME/T5RPG submitted to job queue ME in QGPL
+                                       from job 430526/QUSER/QZRCSRVS. Job 432257/ME/T5RPG was started using the
+                                       Submit Job (SBMJOB) command with the following job attributes: JOBPTY(5)
+                                       OUTPTY(5) PRTTXT(-=* https://example.com *=-) RTGDTA(QCMDB) SYSLIBL(MYSYSSYS
+                                        QSYS       QSYS2      QUSRSYS    QHLPSYS) CURLIB(MYLIB) INLLIBL(MYLIB)
+                                       INLASPGRP(*NONE) LOG(4 00 *SECLVL) LOGCLPGM(*YES) LOGOUTPUT(*JOBEND)
+                                       OUTQ(QGPL/ME) PRTDEV(PRT01) INQMSGRPY(*RQD) HOLD(*NO) DATE(*SYSVAL)
+                                       SWS(00000000)  MSGQ(/*NONE) CCSID(273) SRTSEQ(*N/*HEX) LANGID(ENU)
+                                       CNTRYID(US) JOBMSGQMX(64) JOBMSGQFL(*PRTWRAP) ALWMLTTHD(*NO)
+                                       SPLFACN(*DETACH) ACGCDE().
+*NONE      Request                      26-11-16  22:01:36.143271  QWTSCSBJ                 *N       QCMD        QSYS        0195
+                                     Message . . . . :  -CRTBNDRPG PGM(MYLIB/T5RPG) SRCFILE(MYLIB/T5250SRC)
+                                       SRCMBR(T5RPG)
+RNS9308    Completion              50   26-11-16  22:01:36.182452  QRN4CPP      QDEVTOOLS   *STMT    QCMD        QSYS        01C8
+                                     From module . . . . . . . . :   GRP4CPP
+                                     From procedure  . . . . . . :   cleanup
+                                     Statement . . . . . . . . . :   19
+                                     Message . . . . :   Compilation stopped. Severity 30 errors found in program.
+                                     Cause . . . . . :   The RPG compiler found at least one error in the program
+                                       of severity greater than that specified in the GENLVL option on the
+                                       CRTRPGMOD or CRTBNDRPG command. Recovery  . . . :   Correct the errors in
+                                       the program. Compile again.
+CPC0904    Completion              00   26-11-16  22:01:36.184960  QWCCCRVC     QSYS        0095     QRN4CPP     QDEVTOOLS   *STMT
+                                     To module . . . . . . . . . :   GRP4CPP
+                                     To procedure  . . . . . . . :   update_dtaara
+                                     Statement . . . . . . . . . :   8
+                                     Message . . . . :   Data area RETURNCODE created in library QTEMP.
+RNS9310    Escape                  50   26-11-16  22:01:36.185013  QRN4CPP      QDEVTOOLS   *STMT    QCMD        QSYS        01C8
+                                     From module . . . . . . . . :   GRP4CPP
+                                     From procedure  . . . . . . :   endcomp
+                                     Statement . . . . . . . . . :   20
+                                     Message . . . . :   Compilation failed. Program T5RPG not created in library
+                                       MYLIB.
+                                     Cause . . . . . :   Compilation failure normally occurs when the severity of
+                                       issued messages exceeds the value specified for the GENLVL parameter on the
+                                       CRTBNDRPG command. See the compiler listing or the job log for error
+                                       messages. Recovery  . . . :   Correct the errors or change the value
+                                       specified for the GENLVL parameter. Compile again.
+CPC2402    Completion              50   26-11-16  22:01:36.186708  QCMD         QSYS        066F     *EXT                    *N
+                                     Message . . . . :   Job ended. Cancel message received at command processor.
+                                     Cause . . . . . :   A message with a severity equal to or exceeding the end
+                                       severity was received at the command processor. Recovery  . . . :   See the
+                                       messages previously listed to determine the message that caused the job to
+                                       be ended. Correct the errors, and then try the request again.
+CPC2191    Completion              00   26-11-16  22:01:36.188266  QLIDLOBJ     QSYS        0772     QLICLLIB    QSYS        09DE
+                                     Message . . . . :   Object RETURNCODE in QTEMP type *DTAARA deleted.
+CPF1164    Completion              00   26-11-16  22:01:36.188321  QWTMCEOJ     QSYS        0161     *EXT                    *N
+                                                   -=* https://example.com *=-
+ 5770SS1 V7R5M0 220415                           Job Log                            MYSYS    26-11-16  22:01:36 UTC     Page    2
+  Job name . . . . . . . . . . :   T5RPG           User  . . . . . . :   ME          Number . . . . . . . . . . . :   432257
+  Job description  . . . . . . :   ME             Library . . . . . :   QGPL
+MSGID      TYPE                    SEV  DATE      TIME             FROM PGM     LIBRARY     INST     TO PGM      LIBRARY     INST
+                                     Message . . . . :   Job 432257/ME/T5RPG ended on 26-11-16 at 22:01:36; .014
+                                       seconds used; end code 20 .
+                                     Cause . . . . . :   Job 432257/ME/T5RPG completed on 26-11-16 at 22:01:36
+                                       after it used .014 seconds processing unit time. The maximum temporary
+                                       storage used was 30 megabytes. The job had ending code 20. The job ended
+                                       after 1 routing steps with a secondary ending code of 0.  The job ending
+                                       codes and their meanings are as follows:  0 - The job completed normally. 10
+                                       - The job completed normally during controlled ending or controlled
+                                       subsystem ending. 20 - The job exceeded end severity (ENDSEV job attribute).
+                                       30 - The job ended abnormally. 40 - The job ended before becoming active. 50
+                                       - The job ended while the job was active. 60 - The subsystem ended
+                                       abnormally while the job was active. 70 - The system ended abnormally while
+                                       the job was active. 80 - The job ended (ENDJOBABN command). 90 - The job was
+                                       forced to end after the time limit ended (ENDJOBABN command). Recovery  . .
+                                       . :   For more information, see the Work management topic collection in the
+                                       Systems management category in the IBM i Information Center,
+                                       http://www.ibm.com/systems/i/infocenter/.
+                                                   -=* https://example.com *=-

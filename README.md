@@ -98,6 +98,7 @@ claude mcp add --transport http tn5250 http://127.0.0.1:8250/mcp
 | `spooled_files`, `spooled_file` | list and read printed output: reports, listings, job logs |
 | `list_sessions`, `keys` | housekeeping |
 | *your flows* | one tool per screen flow loaded with `--flows` |
+| *your command tools* | one tool per command tool (`commands:` in the same files): your CL commands, with errors read from their listings |
 
 Several sessions can run side by side (`session` argument).
 
@@ -356,6 +357,75 @@ BUILT   MYLIB/GREET (srvpgm)
 SKIPPED MYLIB/MAIN (pgm): needs MAIN, which failed
 hello: FAILED
 ```
+
+## Command tools
+
+Many shops don't compile with `CRTBNDRPG` directly. A change-management tool,
+a build command or a CL program does it, often in a batch job, and that is
+the way an agent should go too. A **command tool** is such a command with
+typed parameters, defined in YAML under `commands:` (in the files you load
+with `--flows`, next to or instead of `flows:`). Each one becomes a tool of
+its own.
+
+```yaml
+toolset: build
+commands:
+  compile_member:
+    description: Compile a member the way this shop does
+    params:
+      member: {type: string, upper: true, pattern: '^[A-Z$#@][A-Z0-9_$#@]{0,9}$'}
+      note: {type: string, quote: true, default: ""}     # goes in as 'it''s'
+    libl: [TOOLLIB, MYLIB, QGPL]
+    command: MYBUILD MBR({member}) TEXT({note})          # or a list, run in order
+    wait: true            # wait for the job it submits; ok only if that ends normally
+    timeout: 600
+    delete_spooled: true  # remove the listings and job log after reading them
+```
+
+After the command, the tool reads what the work left behind and returns the
+errors with line numbers, the same way for every command:
+
+- **The job.** When a command submits a job (message CPC1221), `wait: true`
+  waits for that job's end message in the history log (CPF1164). The tool
+  fails unless the end code is 0 or 10.
+- **Listings.** It reads the submitted job's spooled files. For a command that
+  doesn't submit anything, it reads what landed in your `QPRTJOB` job while
+  it ran. Compiler listings are turned into `member:line:column` errors:
+  ILE RPG, SQL RPG (both the precompiler's listing and the RPG step's, mapped
+  back from the `QTEMP` copy to your member), ILE CL and DDS (PF, LF, DSPF,
+  PRTF). `RUNSQLSTM` listings are read the same way.
+- **Job log.** A spooled job log (`QPJOBLOG`) is read for its escape and
+  diagnostic messages. `QSYS2.JOBLOG_INFO` can't read the log of a job that
+  has ended.
+
+```text
+FAILED: batch_compile_rpg (job 434989/ME/T5RPG, end code 20)
+ran SBMJOB CMD(CRTBNDRPG PGM(MYLIB/T5RPG) SRCFILE(MYLIB/QRPGLESRC) ...) JOB(T5RPG) MSGQ(*NONE)
+errors from the listings, most severe first:
+  MYLIB/QRPGLESRC(T5RPG):3: severe 30 RNF7030 The name or indicator TOTL is not defined.
+job log:
+  RNS9310 (escape, severity 50) Compilation failed. Program T5RPG not created in library MYLIB.
+read: T5RPG 1 (rpg listing), QPJOBLOG 2 (job log)
+```
+
+- **Safe values.** Values go into the command as CL tokens. Without
+  `quote: true` a value may only hold name-like characters (letters, digits,
+  `_ $ # @ . * / , + - :`), so no parameter can add parameters or commands.
+  With `quote: true` it goes in as a quoted string.
+- **Rules.** Command tools need `--allow-commands`. Every command goes
+  through `--command-allow` and the block list, and for `SBMJOB` so does the
+  command it submits. `--allow-compile` doesn't limit them: a command tool
+  runs what its YAML says. They're never offered in `--read-only` mode, and
+  `--toolsets` applies.
+- **Line numbers.** Listings print source sequence numbers. `line` assumes
+  members numbered 1.00, 2.00, ..., as SEU, `member_write` and `CPYFRMSTMF`
+  number them; the number as printed is in `seq` (`format: json`).
+- **Example.** [examples/flows/commands.yaml](examples/flows/commands.yaml)
+  has `batch_compile_rpg` (SBMJOB CRTBNDRPG, wait, errors). On PUB400 a
+  batch compile with its listing and job log takes about 12 seconds.
+- **From a shell:** `tn5250-run tool compile_member member=HELLO --flows
+  tools.yaml --profile NAME` prints the same report and exits 1 on failure.
+  `tn5250-run check` lists command tools with the flows.
 
 ## Connection profiles
 

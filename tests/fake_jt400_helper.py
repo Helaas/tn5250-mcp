@@ -12,7 +12,21 @@ PASSWORDS = {}
 LIBL = []
 EVF = {}
 MEMBERS = {}
-SPOOL = []
+SPOOL = []          # [file, number, job, lines, created]
+SUBMITTED = {}      # job -> end code
+LISTINGS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "listings")
+
+
+def job_spool(job):
+    """Spooled files of a submitted job: tests/listings/<JOBNAME>-<n>-<FILE>.txt"""
+    jobname = job.split("/")[-1]
+    out = []
+    for f in sorted(os.listdir(LISTINGS)):
+        parts = f[:-4].split("-")
+        if parts[0] == jobname:
+            out.append([parts[2], parts[1], job, open(os.path.join(LISTINGS, f)).read().split(
+                "\n"), "2026-11-16 12:00:03"])
+    return out
 SRC = {("BOBLIB", "QRPGLESRC", "HELLO"): [["1.00", 240101, "**free"],
                                          ["2.00", 240101, "dsply 'hi';"],
                                          ["3.00", 240101, "*inlr = *on;"]]}
@@ -130,6 +144,16 @@ def handle(r):
                                         r"(\w+).FILE/(\w+).MBR'\)", cmd)
             MEMBERS["%s/%s(%s)" % m.group(2, 3, 4)] = open(real(m.group(1))).read()
             return dict(res, ok=True, messages=[])
+        if cmd.startswith("SBMJOB"):
+            name = __import__("re").search(r"JOB\((\w+)\)", cmd).group(1)
+            job = "%06d/BOB/%s" % (432000 + len(SUBMITTED), name)
+            SUBMITTED[job] = 20 if job_spool(job) else 0
+            return dict(res, ok=True, messages=[{"id": "CPC1221", "severity": 0, "type": 1,
+                        "text": "Job %s submitted to job queue QBATCH in library QGPL." % job}])
+        if cmd.startswith("DSPLIBL OUTPUT(*PRINT)"):
+            SPOOL.insert(0, ["QPRTLIBL", str(len(SPOOL) + 7), "654322/BOB/QPRTJOB",
+                             ["Library List", "  MYLIB   USR"], "2026-11-16 12:00:04"])
+            return dict(res, ok=True, messages=[])
         if cmd.startswith("DLTSPLF"):
             SPOOL[:] = [s for s in SPOOL if "FILE(%s)" % s[0] not in cmd]
             return dict(res, ok=True, messages=[])
@@ -142,7 +166,7 @@ def handle(r):
                     SPOOL.insert(0, [stem, str(len(SPOOL) + 5), "654322/BOB/QPRTJOB", [
                         "Record  *...+... 1", "MSG ID  SEV  RECORD  TEXT",
                         "SQL0104  30       2  Position 8 Token SYNTAX was not valid.",
-                        "                    Message Summary"]])
+                        "                    Message Summary"], "2026-11-16 12:00:02"])
                     return dict(res, ok=False, messages=[{"id": "SQL9010", "severity": 30,
                                 "type": 15, "text": "RUNSQLSTM command failed."}])
             return dict(res, ok=True, messages=[])
@@ -203,6 +227,10 @@ def handle(r):
             raise Exception("SQL0204: %s in %s type *FILE not found." % (r["file"], r["lib"]))
         return {"records": EVF[k]}
     if op == "spooled_file":
+        if r["job"] in SUBMITTED:
+            hit = next((s for s in job_spool(r["job"]) if s[0] == r["file"]
+                        and s[1] == r["number"]), None)
+            return {"lines": hit[3] if hit else [], "truncated": False}
         hit = next((s for s in SPOOL if s[0] == r["file"]), None)
         if hit:
             return {"lines": hit[3], "truncated": False}
@@ -219,10 +247,25 @@ def handle(r):
                           "stopped."], ["2026-11-16 12:00:01", "CPC2206", "COMPLETION", "0",
                                         "Ownership changed."]], "params": r["params"]}
     if op == "query" and "SPOOLED_FILE_INFO" in r["sql"]:
-        return {"columns": ["SPOOLED_FILE_NAME", "SPOOLED_FILE_NUMBER", "QUALIFIED_JOB_NAME"],
-                "types": [], "rows": [s[:3] for s in SPOOL] + [["QPRTLIBL", "1",
-                                                                  "654322/BOB/QPRTJOB"]],
-                "truncated": False, "params": r["params"]}
+        if r["params"] and r["params"][0] in SUBMITTED:
+            spool = job_spool(r["params"][0])
+        else:
+            spool = SPOOL + [["QPRTLIBL", "1", "654322/BOB/QPRTJOB", [], "2026-11-15 10:00:00"]]
+        return {"columns": ["SPOOLED_FILE_NAME", "SPOOLED_FILE_NUMBER", "QUALIFIED_JOB_NAME",
+                            "STATUS", "TOTAL_PAGES", "USER_DATA", "CREATION_TIMESTAMP"],
+                "types": [], "rows": [[x[0], x[1], x[2], "READY", "1", None, x[4]]
+                                      for x in spool], "truncated": False,
+                "params": r["params"]}
+    if op == "query" and "VARCHAR(CURRENT TIMESTAMP)" in r["sql"]:
+        return {"columns": ["TS"], "types": [], "rows": [["2026-11-16-12.00.00.000000"]],
+                "truncated": False}
+    if op == "query" and "HISTORY_LOG_INFO" in r["sql"]:
+        job = r["params"][1]
+        if job not in SUBMITTED or os.environ.get("FAKE_JOB_NEVER_ENDS"):
+            return {"columns": ["TEXT"], "types": [], "rows": [], "truncated": False}
+        return {"columns": ["TEXT"], "types": [], "truncated": False, "rows": [[
+            "Job %s ended on 26-11-16 at 12:00:03; .014 seconds used; end code %d ."
+            % (job, SUBMITTED[job])]]}
     if op == "query":
         if not r["sql"].lstrip().upper().startswith(("SELECT", "WITH", "VALUES")):
             raise Exception("SQL0817: Update operation not allowed. (SQLSTATE 42987)")

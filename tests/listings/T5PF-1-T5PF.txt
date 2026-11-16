@@ -1,0 +1,45 @@
+ 5770SS1 V7R5M0  220415                  Data Description               MYLIB/T5PF               26-11-16 22:01:38        Page    1
+ File name . . . . . . . . . . . . . . . . . . . . . :   T5PF
+   Library name  . . . . . . . . . . . . . . . . . . :   MYLIB
+ File attribute  . . . . . . . . . . . . . . . . . . :   Physical
+ Source file containing DDS  . . . . . . . . . . . . :   T5250SRC
+   Library name  . . . . . . . . . . . . . . . . . . :   MYLIB
+ Source member containing DDS  . . . . . . . . . . . :   T5PF
+ Source member last changed  . . . . . . . . . . . . :   26-11-16  22:01:38
+ Source listing options  . . . . . . . . . . . . . . :   *SOURCE    *LIST      *NOSECLVL  *NOEVENTF
+ DDS generation severity level . . . . . . . . . . . :   20
+ DDS flagging severity level . . . . . . . . . . . . :   00
+ File type . . . . . . . . . . . . . . . . . . . . . :   *DATA
+ Authority . . . . . . . . . . . . . . . . . . . . . :   *LIBCRTAUT
+ Replace file  . . . . . . . . . . . . . . . . . . . :   *NO
+ Text  . . . . . . . . . . . . . . . . . . . . . . . :
+ Compiler  . . . . . . . . . . . . . . . . . . . . . :   IBM System i5 Data Description Processor
+                                      Data Description Source
+ SEQNBR  *...+....1....+....2....+....3....+....4....+....5....+....6....+....7....+....8  Date
+    100       A          R T5PFR                                                          26-11-16
+    200       A            F1            5A                                               26-11-16
+*                             CPD7410-*****
+    300       A            F1            5X                                               26-11-16
+*                             CPD7410-*****
+                         * * * * *   E N D   O F   S O U R C E   * * * * *
+                                                   -=* https://example.com *=-
+ 5770SS1 V7R5M0  220415                  Data Description               MYLIB/T5PF               26-11-16 22:01:38        Page    2
+                                          Expanded Source
+                                                                                          Field       Buffer position
+ SEQNBR  *...+....1....+....2....+....3....+....4....+....5....+....6....+....7....+....8 length        Out     In
+    100                  R T5PFR
+                 * * * * *   E N D   O F   E X P A N D E D   S O U R C E   * * * * *
+                                                   -=* https://example.com *=-
+ 5770SS1 V7R5M0  220415                  Data Description               MYLIB/T5PF               26-11-16 22:01:38        Page    3
+                                             Messages
+    ID      Severity  Number
+* CPD7410      30        2      Message . . . . :   Characters in indicated field not allowed.
+                                                   -=* https://example.com *=-
+ 5770SS1 V7R5M0  220415                  Data Description               MYLIB/T5PF               26-11-16 22:01:38        Page    4
+                                          Message Summary
+    Total          Informational          Warning        Error       Severe
+                       (0-9)              (10-19)       (20-29)      (30-99)
+        2                 0                    0             0            2
+* CPF7302      40               Message . . . . :   File T5PF not created in library MYLIB.
+                         * * * * *   E N D   O F   C O M P I L A T I O N   * * * * *
+                                                   -=* https://example.com *=-

@@ -494,6 +494,7 @@ class FlowSet:
 
     def __init__(self) -> None:
         self.flows: dict[str, Flow] = {}
+        self.commands: dict = {}          # name -> cmdtools.CommandTool
 
     @classmethod
     def load(cls, paths: list[str | os.PathLike]) -> "FlowSet":
@@ -518,19 +519,30 @@ class FlowSet:
         self.add_doc(doc, str(path))
 
     def add_doc(self, doc: Any, source: str = "<flows>") -> None:
-        if not isinstance(doc, dict) or not isinstance(doc.get("flows"), dict):
-            raise FlowConfigError("%s: expected a top-level 'flows:' mapping" % source)
-        if set(doc) - {"flows", "toolset"}:
-            raise FlowConfigError("%s: unknown top-level keys %s"
-                                  % (source, sorted(set(doc) - {"flows", "toolset"})))
+        if not isinstance(doc, dict) or not (isinstance(doc.get("flows"), dict)
+                                             or isinstance(doc.get("commands"), dict)):
+            raise FlowConfigError("%s: expected a top-level 'flows:' (screen flows) or "
+                                  "'commands:' (command tools) mapping" % source)
+        if set(doc) - {"flows", "commands", "toolset"}:
+            raise FlowConfigError("%s: unknown top-level keys %s" % (
+                source, sorted(set(doc) - {"flows", "commands", "toolset"})))
         default_ts = doc.get("toolset")
-        for name, spec in doc["flows"].items():
+        if doc.get("commands") is not None:
+            from .cmdtools import parse_commands
+            for name, t in parse_commands(doc, source, default_ts).items():
+                other = self.commands.get(name) or self.flows.get(name)
+                if other or name in (doc.get("flows") or {}):
+                    raise FlowConfigError("%s: command tool %s: defined twice (also in %s)"
+                                          % (source, name, other.source if other else source))
+                self.commands[name] = t
+        for name, spec in (doc.get("flows") or {}).items():
             where = "%s: flow %s" % (source, name)
             if not NAME_RE.match(str(name)):
                 raise FlowConfigError("%s: flow names must be lower_snake_case" % where)
-            if name in self.flows:
+            if name in self.flows or name in self.commands:
                 raise FlowConfigError("%s: defined twice (also in %s)"
-                                      % (where, self.flows[name].source))
+                                      % (where, (self.flows.get(name)
+                                                 or self.commands[name]).source))
             if not isinstance(spec, dict):
                 raise FlowConfigError("%s: must be a mapping" % where)
             bad = set(spec) - FLOW_KEYS
@@ -623,6 +635,11 @@ class FlowSet:
         for st in self.flows[name].steps:
             if st.call:
                 self._no_cycle(st.call, [*stack, name])
+
+    def select_commands(self, toolsets: list[str] | None = None) -> list:
+        """Command tools to expose (they run commands: never in read-only mode)."""
+        return [t for t in self.commands.values()
+                if t.expose and (not toolsets or t.toolset in toolsets)]
 
     def select(self, toolsets: list[str] | None = None, read_only: bool = False,
                allow_secrets: bool = False) -> list[Flow]:

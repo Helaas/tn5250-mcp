@@ -32,6 +32,7 @@ import secrets
 import shutil
 import subprocess
 import threading
+import time
 from importlib import resources
 from pathlib import Path
 
@@ -280,6 +281,17 @@ def pase_runner(d: str, cwd: str | None, timeout: int) -> str:
         'exit 0', ""])
 
 
+def command_names(cmd: str) -> list[str]:
+    """The command, and the one it submits: [SBMJOB, CRTBNDRPG] for
+    'SBMJOB CMD(CRTBNDRPG ...)'."""
+    out = [command_name(cmd)]
+    if out[0] == "SBMJOB":
+        m = re.search(r"\bCMD\(\s*([^\s()]+)", cmd, re.I)
+        if m:
+            out.append(command_name(m.group(1)))
+    return out
+
+
 def command_name(cmd: str) -> str:
     """CRTBNDRPG for 'QSYS/CRTBNDRPG PGM(...)'."""
     first = cmd.strip().split(None, 1)[0].upper() if cmd.strip() else ""
@@ -468,11 +480,41 @@ class HostServers:
             raise HostServerError("running CL commands is off on this server (start it with "
                                   "--allow-commands)")
         cmd = self._guard_command(command)
-        verb = command_name(cmd)
-        if self.command_allow and not any(fnmatch.fnmatch(verb, p) for p in self.command_allow):
-            raise HostServerError("%s is not among the commands this server allows: %s"
-                                  % (verb, ", ".join(self.command_allow)))
+        for verb in command_names(cmd):
+            if self.command_allow and not any(fnmatch.fnmatch(verb, p)
+                                              for p in self.command_allow):
+                raise HostServerError("%s is not among the commands this server allows: %s"
+                                      % (verb, ", ".join(self.command_allow)))
         return self._run_command(name, cmd, libl)
+
+    def server_timestamp(self, name: str) -> str:
+        """CURRENT TIMESTAMP on the IBM i, as text CAST(? AS TIMESTAMP) takes."""
+        res = self.helper.call("query", name=name, params=[], max_rows=1, sql=(
+            "SELECT VARCHAR(CURRENT TIMESTAMP) FROM SYSIBM.SYSDUMMY1"))
+        return str(res["rows"][0][0])
+
+    def wait_for_job(self, name: str, job: str, since: str, timeout: int = 600) -> dict:
+        """Wait until a (submitted) job has ended: its CPF1164 message in the
+        history log, whose text ends in "end code N ." (0 = normal). A finished
+        job without output drops out of JOB_INFO, so the history log is the
+        place to look."""
+        deadline = time.monotonic() + timeout
+        delay = 1.0
+        while True:
+            rows = self.helper.call("query", name=name, params=[since, job], max_rows=1, sql=(
+                "SELECT VARCHAR(MESSAGE_TEXT, 300) FROM TABLE(QSYS2.HISTORY_LOG_INFO("
+                "START_TIME => CAST(? AS TIMESTAMP) - 1 MINUTE)) X "
+                "WHERE MESSAGE_ID = 'CPF1164' AND FROM_JOB = ?"))["rows"]
+            if rows:
+                text = str(rows[0][0])
+                m = re.search(r"end code (\d+)", text)
+                self.log(name, "job ended", text)
+                return {"ended": True, "end_code": int(m.group(1)) if m else None,
+                        "message": text}
+            if time.monotonic() + delay > deadline:
+                return {"ended": False, "end_code": None, "message": None}
+            time.sleep(delay)
+            delay = min(delay * 1.5, 10.0)
 
     def _run_command(self, name: str, cmd: str, libl: list[str] | None) -> dict:
         args = dict(name=name, command=cmd)

@@ -133,7 +133,7 @@ def build_server(mgr: Manager, flows: FlowSet | None = None,
     runner = FlowRunner(mgr, flows, pace=pace)
     mgr.flow_runner = runner
     profiles = profiles if profiles is not None else ProfileSet()
-    mgr.name_taken = lambda n: n in BUILTIN_TOOLS or n in flows.flows
+    mgr.name_taken = lambda n: n in BUILTIN_TOOLS or n in flows.flows or n in flows.commands
 
     async def run(fn, *a, **k):
         try:
@@ -356,7 +356,7 @@ def build_server(mgr: Manager, flows: FlowSet | None = None,
         record folder). The flow is available as a tool right away. Review it
         before relying on it."""
         s = await run(mgr.get, session)
-        if name and (name in BUILTIN_TOOLS or name in flows.flows):
+        if name and (name in BUILTIN_TOOLS or name in flows.flows or name in flows.commands):
             raise ToolError("there is already a tool or flow called %r; pick another name"
                             % name)
         text, path = await run(mgr.record_stop, s, name, description, save,
@@ -386,6 +386,9 @@ def build_server(mgr: Manager, flows: FlowSet | None = None,
         _add_flow_tool(mcp, f, flows, runner, run)
     if hostservers is not None:
         _add_host_tools(mcp, mgr, hostservers, profiles, profiles_only, read_only, run)
+        if hostservers.allow_commands and not read_only:
+            for t in flows.select_commands(toolsets):
+                _add_command_tool(mcp, t, hostservers, run)
     # recordings saved from the viewer become tools too (clients see them on their
     # next tool listing)
     mgr.on_recorded = lambda text: _register_recorded(mcp, flows, runner, run, text, toolsets,
@@ -824,6 +827,41 @@ def _add_flow_tool(mcp: MCPServer, f: Flow, flows: FlowSet, runner: FlowRunner,
     mcp.add_tool(tool, name=f.name, description=_flow_description(f, flows),
                  annotations=ToolAnnotations(read_only_hint=f.read_only,
                                              destructive_hint=not f.read_only,
+                                             open_world_hint=True))
+
+
+def _add_command_tool(mcp: MCPServer, t, hs: HostServers, run) -> None:
+    """A command tool (YAML `commands:`) as an MCP tool."""
+    from .cmdtools import result_text, run_tool
+    if t.name in BUILTIN_TOOLS:
+        raise FlowConfigError("%s: command tool %s has the same name as a built-in tool"
+                              % (t.source, t.name))
+
+    async def tool(**kw):
+        conn = kw.pop("connection", "main")
+        fmt = kw.pop("format", "text")
+        res = await run(run_tool, hs, conn, t, kw)
+        return json.dumps(res, ensure_ascii=False) if fmt == "json" else result_text(res)
+
+    params = [inspect.Parameter(p.name, inspect.Parameter.KEYWORD_ONLY,
+                                annotation=_flow_annotation(p),
+                                default=inspect.Parameter.empty if p.required else p.default)
+              for p in t.params.values()]
+    params.append(inspect.Parameter("format", inspect.Parameter.KEYWORD_ONLY, annotation=Annotated[
+        str, Field(description="text or json")], default="text"))
+    params.append(inspect.Parameter("connection", inspect.Parameter.KEYWORD_ONLY,
+                                    annotation=Conn_, default="main"))
+    tool.__signature__ = inspect.Signature(params, return_annotation=str)
+    tool.__name__ = t.name
+    how = ["Runs: " + " ; ".join(t.commands)]
+    if t.wait:
+        how.append("Waits for the job it submits (up to %ds) and fails unless it ends "
+                   "normally." % t.timeout)
+    if t.spooled:
+        how.append("Then reads the listings and job log it left and returns their errors "
+                   "with line numbers.")
+    mcp.add_tool(tool, name=t.name, description="%s\n\n%s" % (t.description, " ".join(how)),
+                 annotations=ToolAnnotations(read_only_hint=False, destructive_hint=True,
                                              open_world_hint=True))
 
 
