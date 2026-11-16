@@ -11,7 +11,9 @@ flows:
     params:
       user: {type: string, upper: true, pattern: '^[A-Z$#@][A-Z0-9$#@_]{0,9}$',
              description: "user profile"}
-      password: {type: secret, env: T5250_PASSWORD, prompt: "IBM i password"}
+      # user_param: the password is kept for this user and host after a sign-on
+      # that worked, so reconnects and SQL/IFS don't ask again
+      password: {type: secret, env: T5250_PASSWORD, prompt: "IBM i password", user_param: user}
     steps:
       - name: sign on
         expect: "Password"                    # works for custom sign-on screens too
@@ -19,6 +21,9 @@ flows:
         press: Enter
         timeout: 60
         check: {keyboard: any}
+      - name: password expired
+        when: "Password has expired"
+        change_password: {secret: password}   # asks for a new one in the viewer
       - name: refused
         when: "Password"
         fail: "sign-on was refused; the sign-on screen is still showing (see its message line)"

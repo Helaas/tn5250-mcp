@@ -8,6 +8,14 @@ import sys
 
 ROOT = os.environ["FAKE_IFS"]
 conns = {}
+PASSWORDS = {}
+EXPIRED = set(os.environ.get("FAKE_EXPIRED", "").split(",")) - {""}
+
+
+class SecurityError(Exception):
+    def __init__(self, msg, expired=False, new_rejected=False):
+        super().__init__(msg)
+        self.expired = expired
 
 
 def real(p):
@@ -16,12 +24,25 @@ def real(p):
 
 def handle(r):
     op = r["op"]
+    if op == "change_password":
+        if r["old"] != PASSWORDS.get(r["user"], "right-pw"):
+            raise SecurityError("CPF2234: Password not correct for user profile %s." % r["user"])
+        if len(r["new"]) < 6:
+            raise SecurityError("CPF22E5: New password is too short.", new_rejected=True)
+        PASSWORDS[r["user"]] = r["new"]
+        EXPIRED.discard(r["user"])
+        return True
     if op == "connect":
-        if r["password"] != "right-pw":
-            raise Exception("CPF2234: Password not correct for user profile %s." % r["user"])
+        if r["password"] != PASSWORDS.get(r["user"], "right-pw"):
+            raise SecurityError("CPF2234: Password not correct for user profile %s." % r["user"])
+        if r["user"] in EXPIRED:
+            raise SecurityError("CPF22E3: Password has expired.", expired=True)
         conns[r["name"]] = r["user"]
-        return {"user": r["user"], "host": r["host"].upper(), "release": "V7R5M0",
-                "tls": r["tls"]}
+        out = {"user": r["user"], "host": r["host"].upper(), "release": "V7R5M0",
+               "tls": r["tls"]}
+        if os.environ.get("FAKE_WARN_DAYS"):
+            out["expires_in_days"] = int(os.environ["FAKE_WARN_DAYS"])
+        return out
     if op == "crash":
         os._exit(3)
     if r["name"] not in conns:
@@ -75,4 +96,8 @@ for line in sys.stdin:
         resp = {"id": req["id"], "ok": True, "result": handle(req)}
     except Exception as e:  # noqa: BLE001
         resp = {"id": req["id"], "ok": False, "error": str(e)}
+        if isinstance(e, SecurityError):
+            resp["security"] = True
+            if e.expired:
+                resp["expired"] = True
     print(json.dumps(resp), flush=True)

@@ -67,6 +67,7 @@
   <span id="info" class="meta"></span>
   <button id="reconnect" hidden>Reconnect</button>
   <button id="recBtn" hidden title="Record what you do here as a screen flow">&#9679; Record</button>
+  <button id="forgetBtn" title="Forget the passwords this server keeps (memory and keychain)">Forget passwords</button>
 </header>
 <main>
   <div id="empty">No session yet. Ask Claude to connect, then this page shows it live.</div>
@@ -84,8 +85,16 @@
       and it is not logged.</p>
     <!-- password managers stay out: a wrong auto-filled password counts as a failed
          sign-on on the host, and too many disable the user profile -->
+    <p id="pwMsg" hidden style="color:var(--yellow)"></p>
     <input id="pwValue" type="password" name="t5250-prompt" autocomplete="off" required
            data-1p-ignore data-lpignore="true" data-bwignore data-form-type="other">
+    <input id="pwValue2" type="password" name="t5250-prompt-2" autocomplete="off" hidden
+           placeholder="the new password again" style="margin-top:8px"
+           data-1p-ignore data-lpignore="true" data-bwignore data-form-type="other">
+    <label id="pwRememberRow" hidden style="display:flex;gap:8px;align-items:center;color:var(--text)">
+      <input type="checkbox" id="pwRemember" style="width:auto">
+      Remember on this computer (system keychain)
+    </label>
     <p id="pwHint" hidden></p>
     <div class="row2">
       <button type="button" id="pwCancel">Cancel</button>
@@ -126,7 +135,8 @@
 const token = new URLSearchParams(location.search).get("token") || "";
 const VERSION = "__VIEWER_VERSION__";
 const $ = (id) => document.getElementById(id);
-let current = null, lastId = null, dirty = {}, busy = false, promptId = null, pwTyped = false;
+let current = null, lastId = null, dirty = {}, busy = false, promptId = null, pwTyped = false,
+    pwKind = "password";
 const colors = {green:"var(--green)", white:"var(--white)", red:"var(--red)", turquoise:"var(--turquoise)",
                 yellow:"var(--yellow)", pink:"var(--pink)", blue:"var(--blue)", none:"transparent"};
 
@@ -279,6 +289,11 @@ function syncPrompt(p) {
     promptId = p.id;
     $("pwTitle").textContent = p.label;
     $("pwValue").value = ""; pwTyped = false; $("pwHint").hidden = true;
+    $("pwRemember").checked = false; $("pwRememberRow").hidden = !p.remember;
+    pwKind = p.kind || "password";
+    $("pwValue2").value = ""; $("pwValue2").hidden = pwKind !== "new";
+    $("pwValue").placeholder = pwKind === "new" ? "new password" : "";
+    $("pwMsg").textContent = p.message || ""; $("pwMsg").hidden = !p.message;
     if (!dlg.open) dlg.showModal();
     $("pwValue").focus();
   } else if (!p && promptId) {
@@ -287,11 +302,11 @@ function syncPrompt(p) {
   }
 }
 async function answerPrompt(cancel) {
-  const id = promptId, value = $("pwValue").value;
-  $("pwValue").value = "";
+  const id = promptId, value = $("pwValue").value, remember = $("pwRemember").checked;
+  $("pwValue").value = ""; $("pwValue2").value = "";
   promptId = null; $("pw").close();
   if (!id) return;
-  const r = await api("/api/secret", cancel ? {id, cancel: true} : {id, value});
+  const r = await api("/api/secret", cancel ? {id, cancel: true} : {id, value, remember});
   if (!r.ok) $("msg").textContent = r.error;
 }
 // Only send what a person typed or pasted: auto-filled values (no real key presses) are
@@ -304,8 +319,14 @@ $("pwValue").addEventListener("beforeinput", (e) => {
 $("pwValue").addEventListener("paste", (e) => { if (e.isTrusted) pwTyped = true; });
 $("pwForm").addEventListener("submit", (e) => {
   e.preventDefault();
+  if (pwKind === "new" && $("pwValue").value !== $("pwValue2").value) {
+    $("pwValue2").value = "";
+    $("pwHint").textContent = "The two new passwords are not the same; type it again.";
+    $("pwHint").hidden = false; $("pwValue2").focus();
+    return;
+  }
   if (!pwTyped) {
-    $("pwValue").value = "";
+    $("pwValue").value = ""; $("pwValue2").value = "";
     $("pwHint").textContent = "Please type or paste the password yourself; auto-filled values are not sent.";
     $("pwHint").hidden = false; $("pwValue").focus();
     return;
@@ -314,6 +335,12 @@ $("pwForm").addEventListener("submit", (e) => {
 });
 $("pwCancel").addEventListener("click", () => answerPrompt(true));
 $("pw").addEventListener("cancel", (e) => { e.preventDefault(); answerPrompt(true); });
+$("forgetBtn").addEventListener("click", async () => {
+  const r = await api("/api/forget", {});
+  $("msg").style.color = "var(--muted)";
+  $("msg").textContent = r.ok ? `Forgot ${r.count} saved password${r.count === 1 ? "" : "s"}.` : r.error;
+  setTimeout(() => { $("msg").style.color = ""; }, 4000);
+});
 $("recBtn").addEventListener("click", async () => {
   if (!current) return;
   if (!$("recBtn").classList.contains("on")) {

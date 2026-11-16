@@ -16,6 +16,7 @@ from mcp_types import ToolAnnotations
 from pydantic import Field
 
 from .flows import Flow, FlowConfigError, FlowError, FlowRunner, FlowSet
+from .credentials import CredentialStore
 from .guard import DEFAULT_BLOCKED, Guard
 from .hostservers import HostServerError, HostServers, format_table
 from .manager import GuardError, Manager, render
@@ -58,7 +59,7 @@ Workflow: connect -> get_screen -> fill / press -> read the screen that press re
 BUILTIN_TOOLS = {"connect", "disconnect", "list_sessions", "get_screen", "fill", "press",
                  "wait", "viewer", "keys", "record_start", "record_stop", "list_profiles",
                  "get_session_log", "host_connect", "host_disconnect", "sql_query",
-                 "sql_execute", "ifs_list", "ifs_read", "ifs_write"}
+                 "sql_execute", "ifs_list", "ifs_read", "ifs_write", "forget_password"}
 
 Session_ = Annotated[str, Field(description="session name; lets you run several side by side")]
 Conn_ = Annotated[str, Field(description="name of the host-server connection")]
@@ -198,6 +199,17 @@ def build_server(mgr: Manager, flows: FlowSet | None = None,
         happened, also after a disconnect."""
         return await run(mgr.session_log, session, last, screens)
 
+    @mcp.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False,
+                                          idempotent_hint=True))
+    async def forget_password(
+        host: Annotated[str | None, Field(description="only for this host")] = None,
+        user: Annotated[str | None, Field(description="only for this user profile")] = None,
+    ) -> str:
+        """Forget saved passwords (kept after sign-ons that worked, in memory and,
+        if the user chose so, in the system keychain). The next sign-on asks again."""
+        n = await run(mgr.creds.forget, host, user)
+        return "forgot %d saved password%s" % (n, "" if n == 1 else "s")
+
     @mcp.tool(annotations=ToolAnnotations(read_only_hint=True))
     async def list_profiles() -> str:
         """List the saved connection profiles you can connect with."""
@@ -223,14 +235,16 @@ def build_server(mgr: Manager, flows: FlowSet | None = None,
     @mcp.tool(annotations=ToolAnnotations(read_only_hint=True))
     async def list_sessions() -> str:
         """List open sessions and their state."""
+        saved = mgr.creds.saved()
+        saved_line = ("\nsaved passwords (not shown): %s" % ", ".join(saved)) if saved else ""
         if not mgr.sessions:
-            return "no sessions" + viewer_hint()
+            return "no sessions" + saved_line + viewer_hint()
         lines = []
         for name, s in mgr.sessions.items():
             snap = s.snapshot()
             lines.append("%s: %s, keyboard %s, screen_id %s, row 1: %r" % (
                 name, s.host, snap["keyboard"], snap["screen_id"], snap["text"][0].strip()))
-        return "\n".join(lines) + viewer_hint()
+        return "\n".join(lines) + saved_line + viewer_hint()
 
     @mcp.tool(annotations=ToolAnnotations(read_only_hint=True))
     async def get_screen(session: Session_ = "main",
@@ -371,13 +385,19 @@ def build_server(mgr: Manager, flows: FlowSet | None = None,
     return mcp
 
 
-def _host_password(mgr: Manager, name: str, user: str, host: str) -> str:
-    """Password for a host-server connection: typed in the viewer when somebody
-    has it open, else $T5250_PASSWORD; never from the agent."""
+def _host_password(mgr: Manager, name: str, user: str, host: str) -> tuple[str, str, bool]:
+    """Password for a host-server connection, and where it came from: saved
+    (from an earlier sign-on of this user on this host), typed in the viewer
+    when somebody has it open, or $T5250_PASSWORD. Never from the agent."""
+    saved = mgr.creds.get(host, user)
+    if saved:
+        return saved, "saved", False
     if mgr.viewer_url and mgr.viewer_watching_any():
-        return mgr.ask_secret("host:" + name, "IBM i password for %s on %s" % (user, host))
+        v, remember = mgr.ask_secret("host:" + name, "IBM i password for %s on %s"
+                                     % (user.upper(), host), offer_remember=True)
+        return v, "typed", remember
     if os.environ.get("T5250_PASSWORD"):
-        return os.environ["T5250_PASSWORD"]
+        return os.environ["T5250_PASSWORD"], "env", False
     if mgr.viewer_url:
         raise HostServerError("the password for %s is typed by a person: give the user the "
                               "viewer link (%s), ask them to keep it open, then call "
@@ -385,10 +405,71 @@ def _host_password(mgr: Manager, name: str, user: str, host: str) -> str:
     raise HostServerError("no password: set $T5250_PASSWORD, or run with the viewer on")
 
 
+def _host_login(mgr: Manager, hs: HostServers, name: str, host: str, user: str,
+                tls: bool) -> tuple[dict, list[str]]:
+    """Connect with a saved, typed or env password, guarding the profile:
+    a rejected saved password is dropped and asked for once more; an expired
+    password is never retried, the person chooses a new one in the viewer."""
+    notes: list[str] = []
+    pw, source, remember = _host_password(mgr, name, user, host)
+    for attempt in range(3):
+        try:
+            info = hs.connect(name, host, user, pw, tls)
+            break
+        except HostServerError as e:
+            if e.expired:
+                pw = _change_expired_password(mgr, hs, name, host, user, pw, tls, source)
+                source = "changed"
+                notes.append("the password of %s had expired; it was changed in the viewer"
+                             % user.upper())
+                continue                     # sign on with the new one
+            if e.security and source == "saved" and attempt == 0:
+                mgr.creds.invalidate(host, user)     # changed elsewhere? never retry it
+                pw, source, remember = _host_password(mgr, name, user, host)
+                continue
+            raise
+    if source == "typed":
+        mgr.creds.put(host, user, pw, remember=remember)
+    days = info.get("expires_in_days")
+    if days is not None:
+        notes.append("the password of %s expires in %d day%s; change it soon (an expired "
+                     "password is changed in the viewer at the next sign-on)"
+                     % (user.upper(), days, "" if days == 1 else "s"))
+    return info, notes
+
+
+def _change_expired_password(mgr: Manager, hs: HostServers, name: str, host: str, user: str,
+                             old: str, tls: bool, source: str) -> str:
+    if source == "env" or not (mgr.viewer_url and mgr.viewer_watching_any()):
+        raise HostServerError(
+            "the password of %s on %s has expired. Nothing was retried. A person has to "
+            "choose a new one: give the user the viewer link%s and call host_connect again, "
+            "or change it on the system." % (user.upper(), host,
+                                             " (%s)" % mgr.viewer_url if mgr.viewer_url else ""))
+    message = "The password has expired. Choose a new one."
+    for _ in range(3):
+        new, _remember = mgr.ask_secret(
+            "host:" + name, "New password for %s on %s" % (user.upper(), host),
+            kind="new", message=message)
+        try:
+            hs.change_password(host, user, old, new, tls)
+        except HostServerError as e:
+            if e.security and "not correct" in str(e).lower():
+                raise                        # wrong current password: stop, never retry
+            message = "Not accepted: %s" % str(e).splitlines()[0]
+            continue
+        mgr.creds.replace(host, user, new)
+        mgr.on_password_changed(host, user)
+        return new
+    raise HostServerError("the new password was not accepted three times (%s); nothing else "
+                          "was tried" % message)
+
+
 def _add_host_tools(mcp: MCPServer, mgr: Manager, hs: HostServers, profiles: ProfileSet,
                     profiles_only: bool, read_only: bool, run) -> None:
     """SQL and IFS through the IBM i host servers (jt400)."""
     loggers: dict = {}
+    mgr.on_password_changed = lambda host, user: hs.close_user(host, user)
 
     def log(name, kind, text):
         if name not in loggers:
@@ -423,12 +504,10 @@ def _add_host_tools(mcp: MCPServer, mgr: Manager, hs: HostServers, profiles: Pro
             use_tls = True if tls is None else tls
         if not host or not user:
             raise ToolError("host_connect needs a host and a user (or a profile with a user)")
-        pw = await run(_host_password, mgr, name, user, host)
-        info = await run(hs.connect, name, host, user, pw, use_tls)
-        del pw
-        return "connected %s: %s on %s (%s, %s); jt400 %s" % (
+        info, notes = await run(_host_login, mgr, hs, name, host, user, use_tls)
+        return "connected %s: %s on %s (%s, %s); jt400 %s%s" % (
             name, info["user"], info["host"], info["release"], "TLS" if use_tls else "plain",
-            hs.helper.version)
+            hs.helper.version, "".join("\nnote: " + n for n in notes))
 
     @mcp.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False,
                                           idempotent_hint=True))
@@ -604,6 +683,12 @@ def main(argv: list[str] | None = None) -> None:
                    default=[x for x in os.environ.get("T5250_PROFILES", "").split(os.pathsep)
                             if x],
                    help="YAML file or folder of saved connection profiles (repeatable)")
+    p.add_argument("--password-cache-hours", type=float,
+                   default=float(os.environ.get("T5250_PASSWORD_CACHE_HOURS", "8")),
+                   help="keep typed passwords in memory this long after last use (0 = off)")
+    p.add_argument("--no-remember", action="store_true",
+                   default=os.environ.get("T5250_NO_REMEMBER") == "1",
+                   help="never offer to save passwords in the system keychain")
     p.add_argument("--jt400", default=os.environ.get("T5250_JT400"),
                    help="path to jt400.jar (JTOpen) to enable the SQL and IFS tools")
     p.add_argument("--java", default=os.environ.get("T5250_JAVA"),
@@ -647,7 +732,10 @@ def main(argv: list[str] | None = None) -> None:
                   blocked=blocked)
     mgr = Manager(guard, log_dir=a.log_dir, default_codepage=a.codepage,
                   reconnect_attempts=a.reconnect_attempts,
-                  reconnect_interval=a.reconnect_interval, record_dir=a.record_dir)
+                  reconnect_interval=a.reconnect_interval, record_dir=a.record_dir,
+                  creds=CredentialStore(a.password_cache_hours, keychain=not a.no_remember))
+    if mgr.creds.keychain:
+        print("tn5250-mcp: passwords can be remembered in the system keychain", file=sys.stderr)
 
     if a.viewer_port:
         from .viewer import start_viewer

@@ -41,9 +41,11 @@ NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 PARAM_TYPES = {"string", "integer", "number", "boolean", "secret"}
 PARAM_KEYS = {"type", "description", "default", "min_length", "max_length", "pattern",
               "enum", "upper", "min", "max", "decimals", "true_value", "false_value", "env",
-              "prompt"}
+              "prompt", "user_param"}
 STEP_KEYS = {"name", "expect", "when", "fill", "cursor", "press", "wait_for", "timeout",
-             "check", "capture", "call", "with", "fail"}
+             "check", "capture", "call", "with", "fail", "change_password"}
+CHANGE_PASSWORD_LABELS = {"current": "Current password", "new": "New password",
+                          "verify": "New password (to verify)"}
 CHECK_KEYS = {"text", "not_text", "regex", "keyboard", "captured"}
 FLOW_KEYS = {"description", "toolset", "read_only", "expose", "params", "steps", "pace"}
 _TEMPLATE = re.compile(r"\{\{|\}\}|\{([A-Za-z_][A-Za-z0-9_]*)\}")
@@ -85,6 +87,8 @@ class Param:
     false_value: str = "N"
     env: str | None = None
     prompt: str | None = None           # secret: label for the viewer prompt
+    user_param: str | None = None       # secret: parameter with the user profile; lets the
+                                        # password be kept for that user and host
 
     def coerce(self, raw: Any) -> str:
         """Validate a value (from MCP, the CLI or Python) and return the text
@@ -171,6 +175,7 @@ class Step:
     call: str | None = None
     call_with: dict[str, Any] = field(default_factory=dict)
     fail: str | None = None
+    change_password: dict | None = None   # {secret, current, new, verify}: expired password
 
 
 @dataclass
@@ -287,12 +292,14 @@ def _parse_param(name: str, spec: Any, where: str) -> Param:
                                       % (where, name))
             p.env = str(spec["env"])
         p.prompt = str(spec.get("prompt") or p.description or name.replace("_", " ").capitalize())
+        if "user_param" in spec:
+            p.user_param = str(spec["user_param"])
         if "default" in spec:
             raise FlowConfigError("%s: secret parameter %s can't have a default"
                                   % (where, name))
-    elif "env" in spec or "prompt" in spec:
-        raise FlowConfigError("%s: parameter %s: env and prompt are only for type: secret"
-                              % (where, name))
+    elif "env" in spec or "prompt" in spec or "user_param" in spec:
+        raise FlowConfigError("%s: parameter %s: env, prompt and user_param are only for "
+                              "type: secret" % (where, name))
     if "default" in spec:
         p.required = False
         p.default = spec["default"]
@@ -397,6 +404,19 @@ def _parse_step(i: int, spec: Any, where: str) -> Step:
             raise FlowConfigError("%s: fail needs a when condition" % w)
         if st.fill or st.press or st.call:
             raise FlowConfigError("%s: a fail step can't also fill, press or call" % w)
+    if "change_password" in spec:
+        cp = spec["change_password"]
+        if not isinstance(cp, dict) or not cp.get("secret") or \
+                set(cp) - {"secret", "current", "new", "verify"}:
+            raise FlowConfigError("%s: change_password takes secret (the password parameter) "
+                                  "and optionally current, new and verify field labels" % w)
+        if not (st.when or st.expect):
+            raise FlowConfigError("%s: change_password needs when (the expired-password "
+                                  "screen)" % w)
+        if st.fill or st.press or st.call or st.fail or st.cursor:
+            raise FlowConfigError("%s: a change_password step can't also fill, press, call "
+                                  "or fail" % w)
+        st.change_password = dict(CHANGE_PASSWORD_LABELS, **{k: str(v) for k, v in cp.items()})
     acts = bool(st.fill or st.cursor or (st.press and norm_key(st.press) != "reset"))
     if acts and not (st.expect or st.when):
         raise FlowConfigError("%s: a step that fills or presses needs expect (or when), so "
@@ -474,6 +494,12 @@ class FlowSet:
         """Cross-flow checks: calls resolve, no cycles, templates name known
         parameters or captures, read-only flows don't call writing flows."""
         for f in self.flows.values():
+            for p in f.params.values():
+                if p.user_param and (p.user_param not in f.params
+                                     or f.params[p.user_param].type == "secret"):
+                    raise FlowConfigError("%s: flow %s: secret %s: user_param %r must name "
+                                          "another parameter of this flow"
+                                          % (f.source, f.name, p.name, p.user_param))
             known = set(f.params) | f.captures(self)
             for st in f.steps:
                 w = "%s: flow %s step %s" % (f.source, f.name, st.label)
@@ -489,6 +515,11 @@ class FlowSet:
                     if unknown:
                         raise FlowConfigError("%s: {%s} is not a parameter or capture of this "
                                               "flow" % (w, ", ".join(sorted(unknown))))
+                if st.change_password:
+                    sp = f.params.get(st.change_password["secret"])
+                    if not sp or sp.type != "secret":
+                        raise FlowConfigError("%s: change_password.secret must name a secret "
+                                              "parameter of this flow" % w)
                 unknown = set(st.check.captured) - known
                 if unknown:
                     raise FlowConfigError("%s: check.captured: %s is not captured by this flow"
@@ -575,8 +606,20 @@ class FlowRunner:
             raise FlowError("no flow %r (flows: %s)" % (name, ", ".join(self.flows.flows)))
         log: list[str] = []
         secrets: list[str] = []
+        used: list[dict] = []           # where each password came from (see secret())
         self.precheck(flow, params)
-        caps = self._run(s, flow, params, log, secrets, depth=0)
+        try:
+            caps = self._run(s, flow, params, log, secrets, depth=0, used=used)
+        except FlowError as e:
+            # a saved password that didn't get the flow through is dropped: failed
+            # sign-ons count toward disabling the profile
+            for u in used:
+                if u["source"] == "saved" and u["flow"] == e.flow:
+                    self.mgr.creds.invalidate(*u["key"])
+            raise
+        for u in used:                  # typed, and the flow went through: keep it
+            if u["source"] == "typed" and u["key"]:
+                self.mgr.creds.put(*u["key"], u["value"], remember=u["remember"])
         return FlowResult(name, {k: v for k, v in caps.items() if k not in flow.params},
                           log, self._mask(render(s.snapshot()), secrets))
 
@@ -617,12 +660,26 @@ class FlowRunner:
                 raise FlowError("refused before starting: %s (in %s)"
                                 % (e, " > ".join((*stack, flow.name, "step " + st.label))))
 
-    def secret(self, s: Session | None, flow: Flow, p: Param) -> str:
+    def secret(self, s: Session | None, flow: Flow, p: Param, vals: dict[str, str],
+               used: list[dict]) -> str:
+        """A secret parameter's value: saved from an earlier sign-on (when the
+        secret names its user_param), typed in the viewer, or from env."""
+        key = None
+        if p.user_param and s is not None and vals.get(p.user_param):
+            key = (s.host, vals[p.user_param])
+            saved = self.mgr.creds.get(*key)
+            if saved:
+                used.append({"source": "saved", "key": key, "flow": flow.name})
+                return saved
         if s is not None and self.mgr.viewer_url and self.mgr.viewer_watching(s.name):
             try:
-                return self.mgr.ask_secret(s.name, p.prompt or p.name, self.prompt_timeout)
+                v, remember = self.mgr.ask_secret(s.name, p.prompt or p.name, self.prompt_timeout,
+                                                  offer_remember=key is not None)
             except GuardError as e:
                 raise FlowError("%s: %s" % (flow.name, e)) from None
+            used.append({"source": "typed", "key": key, "value": v, "remember": remember,
+                         "flow": flow.name})
+            return v
         v = self.env(p.env) if p.env else None
         if v:
             return v
@@ -634,7 +691,8 @@ class FlowRunner:
             flow.name, p.name, "set $%s" % p.env if p.env else "open the viewer to type it"))
 
     def bind(self, flow: Flow, params: dict[str, Any], secrets: list[str],
-             with_secrets: bool = True, s: Session | None = None) -> dict[str, str]:
+             with_secrets: bool = True, s: Session | None = None,
+             used: list[dict] | None = None) -> dict[str, str]:
         extra = set(params) - set(flow.params)
         if extra:
             raise FlowError("%s has no parameter %s (parameters: %s)" % (
@@ -648,12 +706,7 @@ class FlowRunner:
         out: dict[str, str] = {}
         for n, p in flow.params.items():
             if p.type == "secret":
-                if not with_secrets:
-                    continue
-                v = self.secret(s, flow, p)
-                secrets.append(v)
-                out[n] = v
-                continue
+                continue                       # after the others: user_param must be known
             if n not in params or params[n] is None:
                 if p.required:
                     raise FlowError("%s: missing parameter %s" % (flow.name, n))
@@ -664,11 +717,18 @@ class FlowRunner:
                 out[n] = p.coerce(raw)
             except ValueError as e:
                 raise FlowError("%s: %s" % (flow.name, e)) from None
+        if with_secrets:
+            for n, p in flow.params.items():
+                if p.type == "secret":
+                    v = self.secret(s, flow, p, out, used if used is not None else [])
+                    secrets.append(v)
+                    out[n] = v
         return out
 
     def _run(self, s: Session, flow: Flow, params: dict[str, Any], log: list[str],
-             secrets: list[str], depth: int) -> dict[str, str]:
-        vals = self.bind(flow, params, secrets, s=s)
+             secrets: list[str], depth: int, used: list[dict] | None = None) -> dict[str, str]:
+        used = used if used is not None else []
+        vals = self.bind(flow, params, secrets, s=s, used=used)
         ind = "  " * depth
         pace = max(self.pace, flow.pace)
         s.log("flow", "%s%s %r" % (ind, flow.name, self._mask(repr(
@@ -686,11 +746,15 @@ class FlowRunner:
                 continue
             if st.fail:
                 raise fail(st, tv(st.fail))
+            if st.change_password:
+                self._change_password(s, flow, st, vals, secrets, used, fail)
+                log.append("%s%s/%s: password changed" % (ind, flow.name, st.label))
+                continue
             if st.call:
                 callee = self.flows.flows[st.call]
                 args = {k: (tv(v) if isinstance(v, str) else v) for k, v in st.call_with.items()}
                 log.append("%s%s/%s: call %s" % (ind, flow.name, st.label, st.call))
-                sub = self._run(s, callee, args, log, secrets, depth + 1)
+                sub = self._run(s, callee, args, log, secrets, depth + 1, used)
                 vals.update({k: v for k, v in sub.items() if k not in callee.params})
                 self._check(s, st, vals, fail)
                 continue
@@ -730,6 +794,59 @@ class FlowRunner:
             if pace and (st.press or values or st.cursor):
                 time.sleep(pace)
         return vals
+
+    def _change_password(self, s: Session, flow: Flow, st: Step, vals: dict[str, str],
+                         secrets: list[str], used: list[dict], fail) -> None:
+        """The host says the password has expired: the person chooses a new one
+        in the viewer, it goes into the change-password screen with the current
+        one (which just worked), and the saved password is replaced. Nothing is
+        ever retried with the old password; a wrong current password stops."""
+        cp = st.change_password
+        pname = cp["secret"]
+        p = flow.params[pname]
+        user = vals.get(p.user_param, "") if p.user_param else ""
+        key = (s.host, user) if user else None
+        if not (self.mgr.viewer_url and self.mgr.viewer_watching(s.name)):
+            raise fail(st, "the password%s has expired. Nothing was retried. A person has to "
+                       "choose a new one: give the user the viewer link%s and run the flow "
+                       "again, or change it on the system" % (
+                           " of " + user if user else "",
+                           " (%s)" % self.mgr.viewer_url if self.mgr.viewer_url else ""))
+        screen = [fill_template(t, vals) for t in (st.when or st.expect)]
+        message = "The password has expired. Choose a new one."
+        for _ in range(3):
+            try:
+                new, _remember = self.mgr.ask_secret(
+                    s.name, "New password%s" % (" for " + user if user else ""),
+                    self.prompt_timeout, kind="new", message=message)
+            except GuardError as e:
+                raise fail(st, str(e)) from None
+            secrets.append(new)
+            try:
+                self.mgr.press(s, "Enter", {cp["current"]: vals[pname], cp["new"]: new,
+                                            cp["verify"]: new}, None, screen[0], None, True,
+                               None, 60.0, mask=secrets)
+            except GuardError as e:
+                raise fail(st, str(e)) from None
+            if all(self.mgr.guard.expect_matches(s.rows(), t) for t in screen):
+                msg = s.snapshot()["message_line"].strip()
+                if s.keyboard_state() == "error":
+                    self.mgr.press(s, "Reset")
+                if "not correct" in msg.lower():     # the current password: never retry
+                    raise fail(st, "the host rejected the current password: %s" % msg)
+                message = "Not accepted: %s" % (msg or "see the screen")
+                continue
+            vals[pname] = new
+            for u in used:                   # neither keep nor drop the old one at the end
+                if u.get("key") == key:
+                    u["source"], u["value"] = "changed", new
+            if key:
+                self.mgr.creds.replace(*key, new)
+            self.mgr.on_password_changed(s.host, user)
+            s.log("password changed", user or "(user unknown)")
+            return
+        raise fail(st, "the new password was not accepted three times (%s); nothing else was "
+                   "tried" % message)
 
     def _check(self, s: Session, st: Step, vals: dict[str, str], fail) -> None:
         tv = lambda t: fill_template(t, vals)  # noqa: E731

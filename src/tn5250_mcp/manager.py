@@ -11,6 +11,7 @@ import secrets as _secrets
 import threading
 import time
 
+from .credentials import CredentialStore
 from .guard import Guard
 from .session import FieldError, ProtocolError, Session, norm_key
 
@@ -85,8 +86,11 @@ def render(snap: dict, show_fields: bool = True) -> str:
 class Manager:
     def __init__(self, guard: Guard, log_dir: str | None = None,
                  default_codepage: str = "cp037", reconnect_attempts: int = 10,
-                 reconnect_interval: float = 5.0, record_dir: str | None = None):
+                 reconnect_interval: float = 5.0, record_dir: str | None = None,
+                 creds: CredentialStore | None = None):
         self.guard = guard
+        # passwords people typed, per host and user (memory; keychain if allowed)
+        self.creds = creds if creds is not None else CredentialStore()
         self.reconnect_attempts = reconnect_attempts
         self.reconnect_interval = reconnect_interval
         self.record_dir = record_dir
@@ -96,6 +100,9 @@ class Manager:
         self._devseq: dict[str, object] = {}        # device name pattern -> letters
         self.name_taken = lambda name: False        # set by the MCP server: tool names in use
         self.flow_runner = None                     # runs profiles' after_connect flows
+        # called (host, user) after a password change, so connections that still
+        # hold the old password are closed before they sign on with it again
+        self.on_password_changed = lambda host, user: None
         self.on_recorded = None                     # set by the MCP server: register a flow
         self.log_dir = log_dir
         self.default_codepage = default_codepage
@@ -110,11 +117,17 @@ class Manager:
         """Is somebody looking at this session in the viewer right now?"""
         return time.monotonic() - self.viewer_seen.get(name, -1e9) < within
 
-    def ask_secret(self, name: str, label: str, timeout: float = 120.0) -> str:
+    def ask_secret(self, name: str, label: str, timeout: float = 120.0,
+                   offer_remember: bool = False, kind: str = "password",
+                   message: str | None = None) -> tuple[str, bool]:
         """Show a password prompt in the viewer for this session and wait for
-        the person to answer. The value never reaches the agent or the log."""
+        the person to answer. Returns the value and whether they ticked
+        "Remember on this computer". The value never reaches the agent or the
+        log."""
         p = {"id": _secrets.token_hex(6), "label": label, "value": None,
-             "cancelled": False, "event": threading.Event()}
+             "cancelled": False, "event": threading.Event(),
+             "offer_remember": offer_remember and self.creds.keychain, "remember": False,
+             "kind": kind, "message": message}
         with self.lock:
             if name in self.prompts:
                 raise GuardError("a password prompt is already open in the viewer")
@@ -124,7 +137,7 @@ class Manager:
                 raise GuardError("nobody entered %s in the viewer within %ds" % (label, timeout))
             if p["cancelled"] or not p["value"]:
                 raise GuardError("%s was not entered (cancelled in the viewer)" % label)
-            return p["value"]
+            return p["value"], bool(p["remember"] and p["offer_remember"])
         finally:
             with self.lock:
                 if self.prompts.get(name) is p:
@@ -140,13 +153,16 @@ class Manager:
         connections have no screen of their own)."""
         with self.lock:
             p = self.prompts.get(name) or next(iter(self.prompts.values()), None)
-        return {"id": p["id"], "label": p["label"]} if p else None
+        return {"id": p["id"], "label": p["label"], "remember": p["offer_remember"],
+                "kind": p["kind"], "message": p["message"]} if p else None
 
-    def answer_prompt(self, name: str | None, pid: str, value: str | None) -> bool:
+    def answer_prompt(self, name: str | None, pid: str, value: str | None,
+                      remember: bool = False) -> bool:
         with self.lock:
             p = next((q for q in self.prompts.values() if q["id"] == pid), None)
             if not p:
                 return False
+            p["remember"] = remember
             p["value"], p["cancelled"] = value, value is None
             p["event"].set()
             return True

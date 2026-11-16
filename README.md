@@ -81,6 +81,7 @@ claude mcp add --transport http tn5250 http://127.0.0.1:8250/mcp
 | `record_start`, `record_stop` | record a session's key presses as a new flow |
 | `disconnect` | sign off from the screen's command line, then close (`signoff: false` to skip) |
 | `get_session_log` | the session's transcript (passwords masked), also after a disconnect |
+| `forget_password` | forget saved passwords (memory and keychain) |
 | `host_connect`, `host_disconnect` | open a SQL/IFS connection (with `--jt400`) |
 | `sql_query` | run a query; the connection is read-only on the server side |
 | `sql_execute` | change data (only with `--allow-sql-write`) |
@@ -246,6 +247,7 @@ refused as a whole; it doesn't stop half-way because of a bad value.
 | `capture` | name → regex with one group, `{field: ref}` or `{rows: "3-22"}`. Usable as `{name}` in later steps and returned to the caller |
 | `call`, `with` | run another flow with these parameters |
 | `fail` | with `when`: stop the flow with this message if the text is there |
+| `change_password` | with `when`: the password has expired; ask for a new one in the viewer and fill the change screen (`{secret: password}`, optional `current`, `new`, `verify` field labels) |
 | `name` | step label for logs and errors |
 
 `{name}` inserts a parameter or capture. In regexes the value matches
@@ -335,19 +337,57 @@ test evidence.
 
 A `secret` parameter is never passed in by the caller. When the flow runs:
 
-1. If somebody is watching the session in the viewer, a password dialog opens
-   there and the person types it. The dialog keeps password managers out and
-   only sends what was actually typed or pasted, because an auto-filled stale
-   password counts as a failed sign-on (and enough of those disable the user
-   profile).
-2. Otherwise the parameter's `env` variable is used (CI secrets).
-3. Otherwise the flow stops before anything is typed and tells the agent to
+1. A **saved** password for this user and host is used, if there is one (see
+   below). This needs `user_param: user` on the secret, naming the parameter
+   that holds the user profile, as in the example `signon` flow.
+2. Otherwise, if somebody is watching the session in the viewer, a password
+   dialog opens there and the person types it. The dialog keeps password
+   managers out and only sends what was actually typed or pasted, because an
+   auto-filled stale password counts as a failed sign-on (and enough of those
+   disable the user profile).
+3. Otherwise the parameter's `env` variable is used (CI secrets).
+4. Otherwise the flow stops before anything is typed and tells the agent to
    hand the user the viewer link.
 
 The value goes to the host only: it is masked in transcripts, results and
 errors, and never reaches the agent. Flows with secrets are offered over MCP
 only when the viewer is running, without the secret in their parameters. So an
 agent can run `signon`, and you type the password in the viewer.
+
+**Saved passwords: one prompt, not one per connection.** A typed password that
+signed on successfully is kept in the server's memory, per host and user, until
+it has gone unused for 8 hours (`--password-cache-hours`, 0 = off). The 5250
+sign-on, `host_connect` for SQL/IFS and the sign-on after a reconnect all use
+it, so one prompt covers a whole session.
+
+- **Remember on this computer.** With the `keyring` extra (`pip install
+  "tn5250-mcp[keyring]"`), the password dialog has a checkbox that also stores
+  it in the system keychain (macOS Keychain, Windows Credential Manager, Secret
+  Service on Linux), so later sessions need no prompt at all.
+  `--no-remember` hides the checkbox where policy forbids stored passwords.
+  Anything running as you can ask the keychain for it, as with any saved
+  password.
+- **Forget.** The **Forget passwords** button in the viewer and the
+  `forget_password` tool clear memory and keychain. `list_sessions` names the
+  saved logins (never the passwords).
+- **No retries with rejected passwords.** A saved password the host rejects
+  (changed elsewhere, say) is dropped after that one attempt, and the next
+  connection asks again.
+
+**Expired passwords.** The old password is never tried again. Instead, the
+person chooses a new one in the viewer, typing it twice. On the 5250 side, the
+example `signon` flow's `change_password` step fills the "Password has expired"
+screen. For SQL/IFS the change goes through jt400. Then:
+
+- the saved password is replaced (in the keychain too), and open SQL/IFS
+  connections of that user are closed, so nothing signs on with the old one;
+- if a new password breaks the system's rules, the dialog shows IBM i's reason
+  and asks again, at most three times; a wrong *current* password stops at
+  once;
+- with nobody at the viewer (CI), it stops: "has expired. Nothing was retried."
+
+When a sign-on is inside the system's warning period (`QPWDEXPWRN`),
+`host_connect` says how many days are left.
 
 ## Safety rails
 
@@ -367,7 +407,10 @@ agent can run `signon`, and you type the password in the viewer.
   also drops every flow not marked `read_only`.
 - **Passwords stay with people.** Hidden (non-display) fields are never shown
   to the agent. Sign on in the viewer, or let a sign-on flow ask for the
-  password in the viewer; the agent carries on from there.
+  password in the viewer; the agent carries on from there. A password that
+  worked is reused for that user and host (and kept in the keychain if you
+  chose so); rejected and expired passwords are never retried (see
+  "Passwords").
 - **Terminal-side field checks.** Like a real 5250 terminal, `press` (and the
   viewer) refuse to send when a mandatory-entry field is empty (operator error
   0007), a mandatory-fill field is only partly filled (0014) or a self-check
@@ -444,6 +487,8 @@ listens on 127.0.0.1 and needs the random token, and it checks the Host header.
 | `--record-dir DIR` | `T5250_RECORD_DIR` | recordings are returned, not saved |
 | `--profiles PATH` (repeatable) | `T5250_PROFILES` (`:`-separated) | none |
 | `--profiles-only` | `T5250_PROFILES_ONLY=1` | off |
+| `--password-cache-hours H` | `T5250_PASSWORD_CACHE_HOURS` | `8`, `0` = don't keep passwords |
+| `--no-remember` | `T5250_NO_REMEMBER=1` | checkbox shown when `keyring` is installed |
 | `--jt400 PATH` | `T5250_JT400` | no SQL/IFS tools |
 | `--java PATH` | `T5250_JAVA` | found automatically (Java 11+) |
 | `--allow-sql-write` | `T5250_ALLOW_SQL_WRITE=1` | off |

@@ -14,6 +14,7 @@ import com.ibm.as400.access.AS400;
 import com.ibm.as400.access.AS400JDBCDriver;
 import com.ibm.as400.access.AS400Message;
 import com.ibm.as400.access.AS400Exception;
+import com.ibm.as400.access.AS400SecurityException;
 import com.ibm.as400.access.CharConverter;
 import com.ibm.as400.access.IFSFile;
 import com.ibm.as400.access.IFSFileInputStream;
@@ -73,6 +74,13 @@ public class T5250Helper {
             } catch (Throwable e) {
                 resp.put("ok", false);
                 resp.put("error", describe(e));
+                // wrong password, expired, disabled...: the caller drops a saved password,
+                // or asks for a new one when it expired (never retries the old one)
+                if (e instanceof AS400SecurityException) {
+                    resp.put("security", true);
+                    int rc = ((AS400SecurityException) e).getReturnCode();
+                    if (rc == AS400SecurityException.PASSWORD_EXPIRED) resp.put("expired", true);
+                }
             }
             out.println(Json.write(resp));
         }
@@ -95,6 +103,7 @@ public class T5250Helper {
         switch (op) {
             case "ping": return "pong";
             case "connect": return connect(r);
+            case "change_password": return changePassword(r);
             case "close": {
                 Conn c = CONNS.remove(str(r, "name"));
                 if (c != null) close(c);
@@ -119,6 +128,7 @@ public class T5250Helper {
                         : new AS400(str(r, "host"), str(r, "user"), pw);
         Arrays.fill(pw, '\0');
         sys.setGuiAvailable(false);
+        sys.setUseSystemPasswordExpirationWarningDays(true);   // QPWDEXPWRN
         sys.connectService(AS400.SIGNON);    // fails here on a wrong user or password
         Conn c = new Conn();
         c.system = sys;
@@ -128,7 +138,28 @@ public class T5250Helper {
         res.put("host", sys.getSystemName());
         res.put("release", "V" + sys.getVersion() + "R" + sys.getRelease() + "M" + sys.getModification());
         res.put("tls", tls);
+        try {
+            if (sys.isInPasswordExpirationWarningDays())
+                res.put("expires_in_days", sys.getPasswordExpirationDays());
+        } catch (Exception ignored) { }
         return res;
+    }
+
+    /** Change an (expired) password. Needs the current one; nothing is retried. */
+    static Object changePassword(Map<String, Object> r) throws Exception {
+        boolean tls = Boolean.TRUE.equals(r.get("tls"));
+        AS400 sys = tls ? new SecureAS400(str(r, "host"), str(r, "user"))
+                        : new AS400(str(r, "host"), str(r, "user"));
+        sys.setGuiAvailable(false);
+        char[] old = str(r, "old").toCharArray(), neu = str(r, "new").toCharArray();
+        try {
+            sys.changePassword(old, neu);
+        } finally {
+            Arrays.fill(old, '\0');
+            Arrays.fill(neu, '\0');
+            sys.disconnectAllServices();
+        }
+        return true;
     }
 
     static Conn conn(Map<String, Object> r) {

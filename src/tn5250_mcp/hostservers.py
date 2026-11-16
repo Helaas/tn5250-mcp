@@ -38,7 +38,12 @@ _JAVA_HOMEBREW = ["/opt/homebrew/opt/openjdk/bin/java", "/usr/local/opt/openjdk/
 
 
 class HostServerError(Exception):
-    """A host-server request failed or was refused; the message says why."""
+    """A host-server request failed or was refused; the message says why.
+    `security` is set when IBM i refused the user or password."""
+
+    def __init__(self, message: str, security: bool = False, expired: bool = False):
+        super().__init__(message)
+        self.security, self.expired = security, expired
 
 
 def java_version(java: str) -> int:
@@ -152,7 +157,9 @@ class Helper:
                 raise HostServerError("the Java helper stopped" + (":\n" + tail if tail else ""))
             resp = json.loads(line)
             if not resp.get("ok"):
-                raise HostServerError(resp.get("error") or "request failed")
+                raise HostServerError(resp.get("error") or "request failed",
+                                      security=bool(resp.get("security")),
+                                      expired=bool(resp.get("expired")))
             return resp.get("result")
 
     def close(self) -> None:
@@ -233,10 +240,31 @@ class HostServers:
                 raise HostServerError(str(e)) from None
         info = self.helper.call("connect", name=name, host=host, user=user.upper(),
                                 password=password, tls=tls)
+        info["_host"] = host
         self.conns[name] = info
         self.log(name, "host connect", "%s as %s (%s, %s)" % (
             host, info.get("user"), info.get("release"), "TLS" if tls else "plain"))
         return info
+
+    def change_password(self, host: str, user: str, old: str, new: str,
+                        tls: bool = True) -> None:
+        """Change a user's password (e.g. an expired one). Never logged."""
+        self.helper.call("change_password", host=host, user=user.upper(), old=old, new=new,
+                         tls=tls)
+        self.log("host-" + user.upper(), "password changed", "%s on %s" % (user.upper(), host))
+
+    def close_user(self, host: str, user: str) -> list[str]:
+        """Close the connections of this user on this host (after a password
+        change they hold the old password, and would sign on with it again)."""
+        names = [n for n, i in self.conns.items()
+                 if i.get("_host", "").lower() == host.lower()
+                 and str(i.get("user", "")).upper() == user.upper()]
+        for n in names:
+            try:
+                self.disconnect(n)
+            except HostServerError:
+                self.conns.pop(n, None)
+        return names
 
     def disconnect(self, name: str) -> None:
         self.helper.call("close", name=name)

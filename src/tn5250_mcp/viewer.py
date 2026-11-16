@@ -116,9 +116,12 @@ def start_viewer(mgr: Manager, port: int) -> str:
             try:
                 n = int(self.headers.get("Content-Length", "0"))
                 req = json.loads(self.rfile.read(n) or b"{}")
+                if u.path == "/api/forget":
+                    return self._json({"ok": True, "count": mgr.creds.forget()})
                 if u.path == "/api/secret":           # may belong to no 5250 session
                     ok = mgr.answer_prompt(None, str(req.get("id", "")),
-                                           None if req.get("cancel") else str(req.get("value", "")))
+                                           None if req.get("cancel") else str(req.get("value", "")),
+                                           remember=bool(req.get("remember")))
                     return self._json({"ok": ok} if ok else {
                         "ok": False, "error": "that prompt is no longer open"}, 200 if ok else 409)
                 s = mgr.get(req.get("session", ""))
