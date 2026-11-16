@@ -62,7 +62,7 @@ def cmd_run(a) -> int:
     guard = Guard(require_check=False,
                   blocked=([] if a.no_default_blocks else list(DEFAULT_BLOCKED)) + a.block)
     common = dict(flows=fs, log_dir=a.log_dir, guard=guard, viewer_port=a.viewer_port,
-                  pace=a.pace)
+                  pace=a.pace, jt400=a.jt400, java=a.java)
     if a.profile:
         try:
             t = Terminal.from_profile(a.profile, a.profiles or ["profiles.yaml"], **common)
@@ -142,6 +142,9 @@ def main(argv: list[str] | None = None) -> None:
     r.add_argument("--flows", action="append", default=[],
                    help="YAML file or folder (repeatable; default $T5250_FLOWS)")
     r.add_argument("--host", default=os.environ.get("T5250_HOST"))
+    r.add_argument("--jt400", default=os.environ.get("T5250_JT400"),
+                   help="jt400.jar (JTOpen): lets flows run query steps")
+    r.add_argument("--java", default=os.environ.get("T5250_JAVA"))
     r.add_argument("--profile", default=os.environ.get("T5250_PROFILE"),
                    help="saved connection profile (instead of --host and friends)")
     r.add_argument("--profiles", action="append",

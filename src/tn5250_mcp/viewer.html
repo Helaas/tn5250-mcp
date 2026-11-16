@@ -276,7 +276,8 @@ async function poll(force) {
   rb.innerHTML = rb.classList.contains("on") ? `&#9632; Stop recording (${s.recording})` : "&#9679; Record";
   if (s.keyboard === "disconnected" && s.error) $("msg").textContent = "Disconnected: " + s.error;
   $("info").textContent = `${s.host} · screen ${s.screen_id} · cursor ${s.cursor.row},${s.cursor.col}` +
-    (s.message_waiting ? " · message waiting" : "");
+    (s.message_waiting ? " · message waiting" : "") +
+    (s.flow_status ? " · flow waiting: " + s.flow_status : "");
   const key = s.session + "/" + s.screen_id;
   const typing = Object.keys(dirty).length > 0;
   if (force || key !== lastId && !(typing && current && current.session === s.session && current.screen_id.split(".")[0] === s.screen_id.split(".")[0])) {

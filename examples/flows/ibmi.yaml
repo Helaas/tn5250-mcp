@@ -30,6 +30,9 @@ flows:
       - name: program messages
         when: "Display Program Messages"
         press: Enter
+      - name: break messages
+        when: "1:Display Messages"            # messages delivered in *BREAK mode
+        press: Enter
       - name: press enter to continue
         when: "Press Enter to continue"
         press: Enter

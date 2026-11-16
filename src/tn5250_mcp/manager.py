@@ -35,6 +35,8 @@ def render(snap: dict, show_fields: bool = True) -> str:
             _dt.datetime.fromtimestamp(snap["last_reconnect"]).strftime("%H:%M:%S"),
             snap["reconnects"], snap.get("reconnect_note")
             or "the session started over at sign-on"))
+    if snap.get("flow_status"):
+        out.append("flow waiting: %s" % snap["flow_status"])
     if snap.get("recording") is not None:
         out.append("RECORDING a flow: %d steps so far (record_stop to save it)"
                    % snap["recording"])
@@ -100,6 +102,7 @@ class Manager:
         self._devseq: dict[str, object] = {}        # device name pattern -> letters
         self.name_taken = lambda name: False        # set by the MCP server: tool names in use
         self.flow_runner = None                     # runs profiles' after_connect flows
+        self.hostservers = None                     # SQL/IFS (with --jt400), for query steps
         # called (host, user) after a password change, so connections that still
         # hold the old password are closed before they sign on with it again
         self.on_password_changed = lambda host, user: None
@@ -274,6 +277,7 @@ class Manager:
                          profile.next_device_name(), profile.wide, profile.codepage, timeout,
                          expand=False)
         s.profile = profile
+        s.user = profile.user
         s.log("profile", profile.summary())
         note = self.run_after_connect(s) if profile.after_connect else None
         return s, note
@@ -427,6 +431,12 @@ class Manager:
     def disconnect(self, name: str, signoff: bool = False) -> str | None:
         s = self.get(name)
         note = self.signoff(s) if signoff else None
+        hs = self.hostservers
+        if hs is not None and "flow-" + name in hs.conns:    # the flow's SQL connection
+            try:
+                hs.disconnect("flow-" + name)
+            except Exception:  # noqa: BLE001 - closing anyway
+                hs.conns.pop("flow-" + name, None)
         s.close()
         s.log("disconnect", note or "")
         with self.lock:

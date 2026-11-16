@@ -118,6 +118,9 @@ def test_helper_restarts_after_a_crash(ifs):
         hs.helper.call("crash")
     with pytest.raises(HostServerError, match="not connected"):    # new process, no connections
         hs.helper.call("query", name="main", sql="SELECT 1", params=[], max_rows=1)
+    assert not hs.connected("main")
+    with pytest.raises(HostServerError, match="was lost.*host_connect again"):
+        hs.query("main", "SELECT 1 FROM SYSIBM.SYSDUMMY1")
     hs.close()
 
 

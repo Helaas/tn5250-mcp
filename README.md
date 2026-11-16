@@ -186,7 +186,8 @@ the password in the viewer, or reads it from the environment.
 - `--profiles-only` refuses `connect` with a host name, so the agent can only
   reach the systems you saved.
 - Outside MCP: `Terminal.from_profile("pub400", "profiles.yaml", flows=[...])`,
-  `tn5250-run run --profile pub400 ...` and pytest `--t5250-profile pub400`.
+  `tn5250-run run --profile pub400 ...` and pytest `--t5250-profile pub400`
+  (add `--jt400` / `--t5250-jt400` for flows with query steps).
   When the sign-on flow needs a password that isn't in the environment, these
   print the viewer link and wait for you.
 
@@ -248,6 +249,8 @@ refused as a whole; it doesn't stop half-way because of a bad value.
 | `call`, `with` | run another flow with these parameters |
 | `fail` | with `when`: stop the flow with this message if the text is there |
 | `change_password` | with `when`: the password has expired; ask for a new one in the viewer and fill the change screen (`{secret: password}`, optional `current`, `new`, `verify` field labels) |
+| `query`, `params` | run read-only SQL (needs `--jt400`) with `?` markers filled from `params` (templates allowed there, not in the SQL); `capture` then takes columns of the first row (`{status: JOB_STATUS}`, or `#rows` for the row count), and `check` looks at the result |
+| `repeat` | do the step again until `until` holds (a condition like `check`, or a list of them: any one): `{until: ..., fail_if: ..., every: 5, timeout: 300}`. Works on query steps (polling) and screen steps (e.g. press F5 until a text appears) |
 | `name` | step label for logs and errors |
 
 `{name}` inserts a parameter or capture. In regexes the value matches
@@ -260,8 +263,49 @@ other read-only flows), `expose: false` (a helper for other flows, not a tool),
 A failing flow reports the flow, the step and the screen at that moment. Over
 MCP, a flow returns its step log, its captures and the final screen.
 
+### Waiting for a batch job
+
+Screens often submit a batch job. A flow can wait for it with SQL and only go
+on when it ended normally:
+
+```yaml
+- name: submit
+  expect: "1:Update Prices"
+  fill: {Option: "1"}
+  press: Enter
+  capture: {job_name: 'Job (\d+/\w+/\w+) submitted'}
+- name: wait until it has ended
+  query: >-
+    SELECT COUNT(*) AS ENDED, MAX(VARCHAR(MESSAGE_TEXT, 200)) AS END_MESSAGE
+      FROM TABLE(QSYS2.HISTORY_LOG_INFO(START_TIME => CAST(? AS TIMESTAMP))) X
+     WHERE MESSAGE_ID = 'CPF1164' AND FROM_JOB = ?
+  params: ["{since}", "{job_name}"]
+  capture: {ended: ENDED, end_message: END_MESSAGE}
+  repeat: {until: {captured: {ended: "^[1-9]"}}, every: 5, timeout: 900}
+  check: {captured: {end_message: 'end code 0 '}}    # anything else stops the flow
+- name: next screen
+  ...
+```
+
+While it waits, the agent's screen and the viewer show the attempt and the last
+values. The flow opens its own SQL connection as the signed-on user, reusing
+the saved password (no extra prompt). The ready-made `submit_and_wait` flow
+(`examples/flows/batch.yaml`) does this for any CL command; call it from your
+own flows. Notes from trying this on a real system:
+
+- A finished batch job without spooled output drops out of `QSYS2.JOB_INFO`,
+  so the job's "ended" message (CPF1164, in the history log) is the reliable
+  signal; its text ends in `end code 0 .` for a normal end (20 and up:
+  abnormal). Also, `JOB_INFO`'s `JOB_USER_FILTER` takes a user name, not
+  `*USER`.
+- Submit with `MSGQ(*NONE)` when the flow waits by itself: otherwise the "job
+  completed" message can pop up over the next screen if messages are delivered
+  in `*BREAK` mode.
+- Write `CAST(? AS TIMESTAMP)` rather than `TIMESTAMP(?)`: Db2 for i refuses an
+  untyped `?` there (SQL0418).
+
 See [`examples/flows/`](examples/flows/): `ibmi.yaml` (`signon`, `run_command`,
-a read-only `sql_select`) and `dfu_demo.yaml` (data entry through UPDDTA, plus
+a read-only `sql_select`), `batch.yaml` (`submit_and_wait`) and `dfu_demo.yaml` (data entry through UPDDTA, plus
 `data_entry_test`, the end-to-end test).
 
 ### Recording flows

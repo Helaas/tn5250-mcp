@@ -36,7 +36,8 @@ class Terminal:
                  codepage: str = "cp037", log_dir: str | None = None,
                  guard: Guard | None = None, viewer_port: int | None = None,
                  timeout: float = 20.0, pace: float = 0.0, reconnect_attempts: int = 0,
-                 reconnect_interval: float = 5.0):
+                 reconnect_interval: float = 5.0, jt400: str | None = None,
+                 java: str | None = None):
         self.host, self.port, self.tls, self.verify_tls = host, port, tls, verify_tls
         self.name, self.device_name, self.wide = session, device_name, wide
         self.timeout = timeout
@@ -52,6 +53,9 @@ class Terminal:
         self.runner = FlowRunner(self.mgr, self.flows or FlowSet(), pace=pace)
         self.mgr.flow_runner = self.runner
         self.profile: Profile | None = None
+        if jt400:                              # SQL for flows' query steps
+            from .hostservers import HostServers
+            self.mgr.hostservers = HostServers(jt400, java, guard=self.mgr.guard)
         self._viewer_port = viewer_port
         self.s: Session | None = None
 
@@ -113,6 +117,8 @@ class Terminal:
         if self.s is not None and self.name in self.mgr.sessions:
             self.mgr.disconnect(self.name)
         self.s = None
+        if self.mgr.hostservers is not None:
+            self.mgr.hostservers.close()
 
     def __enter__(self) -> "Terminal":
         return self.connect() if self.s is None else self

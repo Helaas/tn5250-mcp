@@ -33,6 +33,8 @@ def pytest_addoption(parser):
                 default=[x for x in os.environ.get("T5250_PROFILES", "").split(os.pathsep) if x],
                 help="profiles file or folder ($T5250_PROFILES, default ./profiles.yaml)")
     g.addoption("--t5250-port", type=int, default=int(os.environ.get("T5250_PORT", "992")))
+    g.addoption("--t5250-jt400", default=os.environ.get("T5250_JT400"),
+                help="jt400.jar (JTOpen), for flows with query steps ($T5250_JT400)")
     g.addoption("--t5250-no-tls", action="store_true",
                 default=os.environ.get("T5250_TLS") == "0")
     g.addoption("--t5250-insecure", action="store_true",
@@ -69,7 +71,7 @@ def t5250(request, t5250_flows):
         pytest.skip("no credentials: set $T5250_USER/$T5250_PASSWORD, or "
                     "--t5250-viewer-port to sign on by hand")
     common = dict(flows=t5250_flows, log_dir=cfg.getoption("--t5250-log-dir"),
-                  viewer_port=viewer_port)
+                  viewer_port=viewer_port, jt400=cfg.getoption("--t5250-jt400"))
     if profile:
         t = Terminal.from_profile(profile, cfg.getoption("--t5250-profiles") or
                                   ["profiles.yaml"], **common)

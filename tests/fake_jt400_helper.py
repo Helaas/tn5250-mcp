@@ -9,6 +9,7 @@ import sys
 ROOT = os.environ["FAKE_IFS"]
 conns = {}
 PASSWORDS = {}
+JOBPOLL = [0]
 EXPIRED = set(os.environ.get("FAKE_EXPIRED", "").split(",")) - {""}
 
 
@@ -53,6 +54,16 @@ def handle(r):
     if op == "query":
         if not r["sql"].lstrip().upper().startswith(("SELECT", "WITH", "VALUES")):
             raise Exception("SQL0817: Update operation not allowed. (SQLSTATE 42987)")
+        if "JOB_INFO" in r["sql"]:             # a submitted job, advancing per poll
+            states = os.environ.get("FAKE_JOB_STATES", "OUTQ").split(",")
+            JOBPOLL[0] += 1
+            st = states[min(JOBPOLL[0], len(states)) - 1]
+            if st == "GONE":
+                return {"columns": ["JOB_STATUS", "COMPLETION_STATUS"], "types": [],
+                        "rows": [], "truncated": False}
+            done = os.environ.get("FAKE_COMPLETION", "NORMAL") if st == "OUTQ" else None
+            return {"columns": ["JOB_STATUS", "COMPLETION_STATUS"], "types": ["CHAR", "CHAR"],
+                    "rows": [[st, done]], "truncated": False, "params": r["params"]}
         rows = [[str(i), "ITEM %d" % i, None if i == 2 else "%d.50" % i] for i in range(1, 6)]
         n = r["max_rows"]
         return {"columns": ["ID", "NAME", "PRICE"], "types": ["INTEGER", "CHAR", "DECIMAL"],

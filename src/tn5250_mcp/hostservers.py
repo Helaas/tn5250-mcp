@@ -119,6 +119,7 @@ class Helper:
         self.ids = 0
         self.stderr = collections.deque(maxlen=50)
         self.version = None
+        self.generation = 0          # +1 per process start: connections don't survive one
 
     def _start(self) -> None:
         try:
@@ -127,6 +128,7 @@ class Helper:
                                          text=True, encoding="utf-8", bufsize=1)
         except OSError as e:
             raise HostServerError("could not start the Java helper: %s" % e) from None
+        self.generation += 1
         threading.Thread(target=self._drain, args=(self.proc,), daemon=True).start()
         line = self.proc.stdout.readline()
         if not line:
@@ -241,6 +243,7 @@ class HostServers:
         info = self.helper.call("connect", name=name, host=host, user=user.upper(),
                                 password=password, tls=tls)
         info["_host"] = host
+        info["_gen"] = self.helper.generation
         self.conns[name] = info
         self.log(name, "host connect", "%s as %s (%s, %s)" % (
             host, info.get("user"), info.get("release"), "TLS" if tls else "plain"))
@@ -271,7 +274,17 @@ class HostServers:
         self.conns.pop(name, None)
         self.log(name, "host disconnect", "")
 
+    def connected(self, name: str) -> bool:
+        """Open, and in the helper process that is running now."""
+        info = self.conns.get(name)
+        return bool(info) and info.get("_gen") == self.helper.generation and \
+            self.helper.proc is not None and self.helper.proc.poll() is None
+
     def _need(self, name: str) -> None:
+        if name in self.conns and not self.connected(name):
+            self.conns.pop(name, None)
+            raise HostServerError("the connection %r was lost (the Java helper restarted); "
+                                  "call host_connect again" % name)
         if name not in self.conns:
             raise HostServerError("no host-server connection %r; use host_connect first%s" % (
                 name, " (open: %s)" % ", ".join(self.conns) if self.conns else ""))
@@ -387,3 +400,84 @@ def format_table(res: dict, max_width: int = 40) -> str:
                                  "; more rows not shown, raise max_rows or narrow the query"
                                  if res.get("truncated") else ""))
     return "\n".join(out)
+
+
+# -- signing on (shared by the MCP tools and screen flows) ------------------------
+def host_password(mgr, name: str, user: str, host: str) -> tuple[str, str, bool]:
+    """Password for a host-server connection, and where it came from: saved
+    (from an earlier sign-on of this user on this host), typed in the viewer
+    when somebody has it open, or $T5250_PASSWORD. Never from the agent."""
+    saved = mgr.creds.get(host, user)
+    if saved:
+        return saved, "saved", False
+    if mgr.viewer_url and mgr.viewer_watching_any():
+        v, remember = mgr.ask_secret("host:" + name, "IBM i password for %s on %s"
+                                     % (user.upper(), host), offer_remember=True)
+        return v, "typed", remember
+    if os.environ.get("T5250_PASSWORD"):
+        return os.environ["T5250_PASSWORD"], "env", False
+    if mgr.viewer_url:
+        raise HostServerError("the password for %s is typed by a person: give the user the "
+                              "viewer link (%s), ask them to keep it open, then call "
+                              "host_connect again" % (user, mgr.viewer_url))
+    raise HostServerError("no password: set $T5250_PASSWORD, or run with the viewer on")
+
+
+def host_login(mgr, hs: "HostServers", name: str, host: str, user: str,
+                tls: bool) -> tuple[dict, list[str]]:
+    """Connect with a saved, typed or env password, guarding the profile:
+    a rejected saved password is dropped and asked for once more; an expired
+    password is never retried, the person chooses a new one in the viewer."""
+    notes: list[str] = []
+    pw, source, remember = host_password(mgr, name, user, host)
+    for attempt in range(3):
+        try:
+            info = hs.connect(name, host, user, pw, tls)
+            break
+        except HostServerError as e:
+            if e.expired:
+                pw = change_expired_password(mgr, hs, name, host, user, pw, tls, source)
+                source = "changed"
+                notes.append("the password of %s had expired; it was changed in the viewer"
+                             % user.upper())
+                continue                     # sign on with the new one
+            if e.security and source == "saved" and attempt == 0:
+                mgr.creds.invalidate(host, user)     # changed elsewhere? never retry it
+                pw, source, remember = host_password(mgr, name, user, host)
+                continue
+            raise
+    if source == "typed":
+        mgr.creds.put(host, user, pw, remember=remember)
+    days = info.get("expires_in_days")
+    if days is not None:
+        notes.append("the password of %s expires in %d day%s; change it soon (an expired "
+                     "password is changed in the viewer at the next sign-on)"
+                     % (user.upper(), days, "" if days == 1 else "s"))
+    return info, notes
+
+
+def change_expired_password(mgr, hs: "HostServers", name: str, host: str, user: str,
+                             old: str, tls: bool, source: str) -> str:
+    if source == "env" or not (mgr.viewer_url and mgr.viewer_watching_any()):
+        raise HostServerError(
+            "the password of %s on %s has expired. Nothing was retried. A person has to "
+            "choose a new one: give the user the viewer link%s and call host_connect again, "
+            "or change it on the system." % (user.upper(), host,
+                                             " (%s)" % mgr.viewer_url if mgr.viewer_url else ""))
+    message = "The password has expired. Choose a new one."
+    for _ in range(3):
+        new, _remember = mgr.ask_secret(
+            "host:" + name, "New password for %s on %s" % (user.upper(), host),
+            kind="new", message=message)
+        try:
+            hs.change_password(host, user, old, new, tls)
+        except HostServerError as e:
+            if e.security and "not correct" in str(e).lower():
+                raise                        # wrong current password: stop, never retry
+            message = "Not accepted: %s" % str(e).splitlines()[0]
+            continue
+        mgr.creds.replace(host, user, new)
+        mgr.on_password_changed(host, user)
+        return new
+    raise HostServerError("the new password was not accepted three times (%s); nothing else "
+                          "was tried" % message)

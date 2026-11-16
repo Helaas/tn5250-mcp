@@ -129,6 +129,8 @@ class Session:
         self.last_reconnect: float | None = None   # wall clock of the last good reconnect
         self.recording_steps: int | None = None    # steps so far while a recorder runs
         self.profile = None                        # the Profile it was opened with, if any
+        self.user: str | None = None               # who signed on (known from sign-on flows)
+        self.flow_status: str | None = None        # what a running flow is waiting for
         self.reconnect_note: str | None = None     # what happened after the last reconnect
 
     # ------------------------------------------------------------------ io
@@ -884,6 +886,7 @@ class Session:
                 "recording": self.recording_steps,
                 "profile": self.profile.name if self.profile else None,
                 "reconnect_note": self.reconnect_note,
+                "flow_status": self.flow_status,
             }
 
     def cell_attrs(self) -> list[int]:

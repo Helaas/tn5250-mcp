@@ -1,0 +1,41 @@
+# Batch jobs: submit one from a screen, wait until it has ended (with SQL),
+# and only go on when it ended normally. Needs the SQL tools (--jt400).
+#
+# A finished batch job without spooled output drops out of QSYS2.JOB_INFO,
+# so the wait looks for the job's "ended" message (CPF1164) in the history
+# log instead; its text ends in "end code 0 ." when the job ended normally.
+
+toolset: ibmi
+flows:
+  submit_and_wait:
+    description: >-
+      Submit a CL command as a batch job from the IBM i Main Menu, wait until
+      the job has ended, and fail unless it ended normally (end code 0).
+      Returns job_name and end_message. Call it from other flows to continue
+      only after a successful job.
+    params:
+      command: {type: string, min_length: 1, max_length: 100,
+                description: "CL command to run in batch, e.g. CALL PGM(MYLIB/NIGHTLY)"}
+      job: {type: string, upper: true, pattern: '^[A-Z$#@][A-Z0-9_$#@]{0,9}$', default: T5250JOB,
+            description: "job name"}
+    steps:
+      - name: note the time
+        query: SELECT CURRENT TIMESTAMP - 1 MINUTE AS SINCE FROM SYSIBM.SYSDUMMY1
+        capture: {since: SINCE}
+      - name: submit
+        expect: "IBM i Main Menu"
+        # MSGQ(*NONE): no "job completed" message, which would pop up over the screen
+        # when your messages are delivered in *BREAK mode (completion is checked below)
+        fill: {"Selection or command": "SBMJOB CMD({command}) JOB({job}) MSGQ(*NONE)"}
+        press: Enter
+        check: {text: "IBM i Main Menu"}
+        capture: {job_name: 'Job (\d+/[A-Z0-9_$#@]+/[A-Z0-9_$#@]+) submitted'}
+      - name: wait until it has ended
+        query: >-
+          SELECT COUNT(*) AS ENDED, MAX(VARCHAR(MESSAGE_TEXT, 200)) AS END_MESSAGE
+            FROM TABLE(QSYS2.HISTORY_LOG_INFO(START_TIME => CAST(? AS TIMESTAMP))) X
+           WHERE MESSAGE_ID = 'CPF1164' AND FROM_JOB = ?
+        params: ["{since}", "{job_name}"]
+        capture: {ended: ENDED, end_message: END_MESSAGE}
+        repeat: {until: {captured: {ended: "^[1-9]"}}, every: 5, timeout: 900}
+        check: {captured: {end_message: 'end code 0 '}}    # anything else stops the flow

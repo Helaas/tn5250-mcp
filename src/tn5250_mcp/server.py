@@ -18,7 +18,7 @@ from pydantic import Field
 from .flows import Flow, FlowConfigError, FlowError, FlowRunner, FlowSet
 from .credentials import CredentialStore
 from .guard import DEFAULT_BLOCKED, Guard
-from .hostservers import HostServerError, HostServers, format_table
+from .hostservers import HostServerError, HostServers, format_table, host_login
 from .manager import GuardError, Manager, render
 from .profiles import ProfileError, ProfileSet
 from .session import ALL_KEYS
@@ -385,91 +385,12 @@ def build_server(mgr: Manager, flows: FlowSet | None = None,
     return mcp
 
 
-def _host_password(mgr: Manager, name: str, user: str, host: str) -> tuple[str, str, bool]:
-    """Password for a host-server connection, and where it came from: saved
-    (from an earlier sign-on of this user on this host), typed in the viewer
-    when somebody has it open, or $T5250_PASSWORD. Never from the agent."""
-    saved = mgr.creds.get(host, user)
-    if saved:
-        return saved, "saved", False
-    if mgr.viewer_url and mgr.viewer_watching_any():
-        v, remember = mgr.ask_secret("host:" + name, "IBM i password for %s on %s"
-                                     % (user.upper(), host), offer_remember=True)
-        return v, "typed", remember
-    if os.environ.get("T5250_PASSWORD"):
-        return os.environ["T5250_PASSWORD"], "env", False
-    if mgr.viewer_url:
-        raise HostServerError("the password for %s is typed by a person: give the user the "
-                              "viewer link (%s), ask them to keep it open, then call "
-                              "host_connect again" % (user, mgr.viewer_url))
-    raise HostServerError("no password: set $T5250_PASSWORD, or run with the viewer on")
-
-
-def _host_login(mgr: Manager, hs: HostServers, name: str, host: str, user: str,
-                tls: bool) -> tuple[dict, list[str]]:
-    """Connect with a saved, typed or env password, guarding the profile:
-    a rejected saved password is dropped and asked for once more; an expired
-    password is never retried, the person chooses a new one in the viewer."""
-    notes: list[str] = []
-    pw, source, remember = _host_password(mgr, name, user, host)
-    for attempt in range(3):
-        try:
-            info = hs.connect(name, host, user, pw, tls)
-            break
-        except HostServerError as e:
-            if e.expired:
-                pw = _change_expired_password(mgr, hs, name, host, user, pw, tls, source)
-                source = "changed"
-                notes.append("the password of %s had expired; it was changed in the viewer"
-                             % user.upper())
-                continue                     # sign on with the new one
-            if e.security and source == "saved" and attempt == 0:
-                mgr.creds.invalidate(host, user)     # changed elsewhere? never retry it
-                pw, source, remember = _host_password(mgr, name, user, host)
-                continue
-            raise
-    if source == "typed":
-        mgr.creds.put(host, user, pw, remember=remember)
-    days = info.get("expires_in_days")
-    if days is not None:
-        notes.append("the password of %s expires in %d day%s; change it soon (an expired "
-                     "password is changed in the viewer at the next sign-on)"
-                     % (user.upper(), days, "" if days == 1 else "s"))
-    return info, notes
-
-
-def _change_expired_password(mgr: Manager, hs: HostServers, name: str, host: str, user: str,
-                             old: str, tls: bool, source: str) -> str:
-    if source == "env" or not (mgr.viewer_url and mgr.viewer_watching_any()):
-        raise HostServerError(
-            "the password of %s on %s has expired. Nothing was retried. A person has to "
-            "choose a new one: give the user the viewer link%s and call host_connect again, "
-            "or change it on the system." % (user.upper(), host,
-                                             " (%s)" % mgr.viewer_url if mgr.viewer_url else ""))
-    message = "The password has expired. Choose a new one."
-    for _ in range(3):
-        new, _remember = mgr.ask_secret(
-            "host:" + name, "New password for %s on %s" % (user.upper(), host),
-            kind="new", message=message)
-        try:
-            hs.change_password(host, user, old, new, tls)
-        except HostServerError as e:
-            if e.security and "not correct" in str(e).lower():
-                raise                        # wrong current password: stop, never retry
-            message = "Not accepted: %s" % str(e).splitlines()[0]
-            continue
-        mgr.creds.replace(host, user, new)
-        mgr.on_password_changed(host, user)
-        return new
-    raise HostServerError("the new password was not accepted three times (%s); nothing else "
-                          "was tried" % message)
-
-
 def _add_host_tools(mcp: MCPServer, mgr: Manager, hs: HostServers, profiles: ProfileSet,
                     profiles_only: bool, read_only: bool, run) -> None:
     """SQL and IFS through the IBM i host servers (jt400)."""
     loggers: dict = {}
     mgr.on_password_changed = lambda host, user: hs.close_user(host, user)
+    mgr.hostservers = hs                     # flows' query steps use it too
 
     def log(name, kind, text):
         if name not in loggers:
@@ -504,7 +425,7 @@ def _add_host_tools(mcp: MCPServer, mgr: Manager, hs: HostServers, profiles: Pro
             use_tls = True if tls is None else tls
         if not host or not user:
             raise ToolError("host_connect needs a host and a user (or a profile with a user)")
-        info, notes = await run(_host_login, mgr, hs, name, host, user, use_tls)
+        info, notes = await run(host_login, mgr, hs, name, host, user, use_tls)
         return "connected %s: %s on %s (%s, %s); jt400 %s%s" % (
             name, info["user"], info["host"], info["release"], "TLS" if use_tls else "plain",
             hs.helper.version, "".join("\nnote: " + n for n in notes))

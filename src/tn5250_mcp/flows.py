@@ -43,7 +43,9 @@ PARAM_KEYS = {"type", "description", "default", "min_length", "max_length", "pat
               "enum", "upper", "min", "max", "decimals", "true_value", "false_value", "env",
               "prompt", "user_param"}
 STEP_KEYS = {"name", "expect", "when", "fill", "cursor", "press", "wait_for", "timeout",
-             "check", "capture", "call", "with", "fail", "change_password"}
+             "check", "capture", "call", "with", "fail", "change_password", "query", "params",
+             "repeat"}
+REPEAT_KEYS = {"until", "fail_if", "every", "timeout"}
 CHANGE_PASSWORD_LABELS = {"current": "Current password", "new": "New password",
                           "verify": "New password (to verify)"}
 CHECK_KEYS = {"text", "not_text", "regex", "keyboard", "captured"}
@@ -176,6 +178,18 @@ class Step:
     call_with: dict[str, Any] = field(default_factory=dict)
     fail: str | None = None
     change_password: dict | None = None   # {secret, current, new, verify}: expired password
+    query: str | None = None              # SQL through the host servers (read-only)
+    params: list = field(default_factory=list)
+    repeat: "Repeat | None" = None
+
+
+@dataclass
+class Repeat:
+    """Do a step again until a condition holds: polling a query or a screen."""
+    until: list[Check]                    # any of these
+    fail_if: list[Check] = field(default_factory=list)
+    every: float = 5.0
+    timeout: float = 300.0
 
 
 @dataclass
@@ -368,9 +382,60 @@ def _parse_step(i: int, spec: Any, where: str) -> Step:
         if not isinstance(spec["timeout"], (int, float)) or spec["timeout"] <= 0:
             raise FlowConfigError("%s: timeout must be a positive number of seconds" % w)
         st.timeout = float(spec["timeout"])
+    if "query" in spec:
+        q = spec["query"]
+        if not isinstance(q, str) or not q.strip():
+            raise FlowConfigError("%s: query is an SQL statement" % w)
+        if _template_names(q):
+            raise FlowConfigError("%s: no {templates} inside a query (they would become SQL); "
+                                  "use ? markers and params instead" % w)
+        st.query = q.strip()
+        prm = spec.get("params") or []
+        if not isinstance(prm, list) or not all(
+                isinstance(x, (str, int, float)) and not isinstance(x, bool) or x is None
+                for x in prm):
+            raise FlowConfigError("%s: params is a list of values for the ? markers" % w)
+        if prm and len(prm) != q.count("?"):
+            raise FlowConfigError("%s: the query has %d ? markers but %d params"
+                                  % (w, q.count("?"), len(prm)))
+        st.params = list(prm)
+        if any(k in spec for k in ("fill", "press", "cursor", "call", "fail",
+                                   "change_password", "wait_for")):
+            raise FlowConfigError("%s: a query step can't also fill, press, call, wait or fail"
+                                  % w)
+    elif "params" in spec:
+        raise FlowConfigError("%s: params belongs to a query step" % w)
+    if "repeat" in spec:
+        rp = spec["repeat"]
+        if not isinstance(rp, dict) or "until" not in rp or set(rp) - REPEAT_KEYS:
+            raise FlowConfigError("%s: repeat takes until (required), fail_if, every and "
+                                  "timeout" % w)
+
+        def conds(v, what):
+            items = v if isinstance(v, list) else [v]
+            if not items:
+                raise FlowConfigError("%s: repeat.%s is empty" % (w, what))
+            return [_parse_check(c, "%s repeat.%s" % (w, what)) for c in items]
+        every, timeout = rp.get("every", 5), rp.get("timeout", 300)
+        for k, v, lo, hi in (("every", every, 0.1, 3600), ("timeout", timeout, 1, 86400)):
+            if not isinstance(v, (int, float)) or isinstance(v, bool) or not lo <= v <= hi:
+                raise FlowConfigError("%s: repeat.%s is seconds (%g-%g)" % (w, k, lo, hi))
+        st.repeat = Repeat(until=conds(rp["until"], "until"),
+                           fail_if=conds(rp["fail_if"], "fail_if") if rp.get("fail_if") else [],
+                           every=float(every), timeout=float(timeout))
+        if spec.get("fill") and not spec.get("press"):
+            raise FlowConfigError("%s: repeat on a step that fills without pressing does "
+                                  "nothing new each time" % w)
     cap = spec.get("capture") or {}
     if not isinstance(cap, dict):
         raise FlowConfigError("%s: capture must map name -> regex or {field: ref}" % w)
+    if st.query:                          # query steps capture result columns
+        for name, c in cap.items():
+            if not NAME_RE.match(str(name)) or not isinstance(c, str) or not c.strip():
+                raise FlowConfigError("%s: capture %s: give a column name (or #rows)"
+                                      % (w, name))
+            st.capture[str(name)] = c.strip()
+        cap = {}
     for name, c in cap.items():
         if not NAME_RE.match(str(name)):
             raise FlowConfigError("%s: capture name %r must be lower_snake_case" % (w, name))
@@ -503,7 +568,11 @@ class FlowSet:
             known = set(f.params) | f.captures(self)
             for st in f.steps:
                 w = "%s: flow %s step %s" % (f.source, f.name, st.label)
+                rconds = [*st.repeat.until, *st.repeat.fail_if] if st.repeat else []
                 texts = [*st.expect, *st.when, *st.fill.values(), *st.fill.keys(),
+                         *[str(x) for x in st.params if isinstance(x, str)],
+                         *[t for c in rconds for t in (*c.text, *c.not_text, *c.regex)],
+                         *[r for c in rconds for rs in c.captured.values() for r in rs],
                          st.cursor or "", st.wait_for or "", st.fail or "",
                          *st.check.text, *st.check.not_text, *st.check.regex,
                          *[r for rs in st.check.captured.values() for r in rs],
@@ -620,6 +689,8 @@ class FlowRunner:
         for u in used:                  # typed, and the flow went through: keep it
             if u["source"] == "typed" and u["key"]:
                 self.mgr.creds.put(*u["key"], u["value"], remember=u["remember"])
+            if u.get("key"):
+                s.user = u["key"][1]    # who is signed on (for the flow's SQL steps)
         return FlowResult(name, {k: v for k, v in caps.items() if k not in flow.params},
                           log, self._mask(render(s.snapshot()), secrets))
 
@@ -651,6 +722,8 @@ class FlowRunner:
                     self.precheck(callee, args, (*stack, flow.name))
                 continue
             known = {}
+            if st.query:
+                known["sql"] = st.query
             for k, v in st.fill.items():
                 if not (_template_names(k) | _template_names(v)) - set(vals):
                     known[fill_template(k, vals)] = fill_template(v, vals)
@@ -758,6 +831,15 @@ class FlowRunner:
                 vals.update({k: v for k, v in sub.items() if k not in callee.params})
                 self._check(s, st, vals, fail)
                 continue
+            if st.repeat:
+                did = self._repeat(s, flow, st, vals, secrets, fail, ind)
+                log.append("%s%s/%s: %s" % (ind, flow.name, st.label, did))
+                continue
+            if st.query:
+                text = self._query(s, st, vals, fail)
+                self._check(s, st, vals, fail, text=text)
+                log.append("%s%s/%s: query" % (ind, flow.name, st.label))
+                continue
             expects = [tv(e) for e in (st.expect or st.when)]
             values = {tv(k): tv(v) for k, v in st.fill.items()}
             try:
@@ -848,28 +930,168 @@ class FlowRunner:
         raise fail(st, "the new password was not accepted three times (%s); nothing else was "
                    "tried" % message)
 
-    def _check(self, s: Session, st: Step, vals: dict[str, str], fail) -> None:
+    # -- SQL steps and repeats ----------------------------------------------------
+    def _query(self, s: Session, st: Step, vals: dict[str, str], fail) -> str:
+        """Run the step's query (read-only, through the host servers) and
+        capture columns of the first row. Returns the result as a text table."""
+        from .hostservers import HostServerError, format_table, host_login
+        hs = getattr(self.mgr, "hostservers", None)
+        if hs is None:
+            raise fail(st, "this server can't run SQL: start it with --jt400")
+        conn = "flow-" + s.name
+        if not hs.connected(conn):
+            user = s.user or (s.profile.user if s.profile else None)
+            if not user:
+                raise fail(st, "don't know which user to run SQL as: sign on with a flow whose "
+                               "password names its user_param, or set user in the profile")
+            try:
+                host_login(self.mgr, hs, conn, s.host, user, s.tls)
+            except HostServerError as e:
+                raise fail(st, str(e)) from None
+        params = [fill_template(p, vals) if isinstance(p, str) else p for p in st.params]
+        try:
+            res = hs.query(conn, st.query, params, max_rows=100)
+        except HostServerError as e:
+            raise fail(st, str(e)) from None
+        cols = [str(c).upper() for c in res.get("columns", [])]
+        rows = res.get("rows", [])
+        for name, col in st.capture.items():
+            if col == "#rows":
+                vals[name] = str(len(rows))
+                continue
+            if col.upper() not in cols:
+                raise fail(st, "capture %s: the query has no column %s (columns: %s)"
+                           % (name, col, ", ".join(cols)))
+            v = rows[0][cols.index(col.upper())] if rows else None
+            vals[name] = "" if v is None else str(v)
+        return format_table(res)
+
+    def _holds(self, s: Session, conds: list[Check], vals: dict[str, str],
+               text: str | None) -> bool:
+        """Does any of these conditions hold (on the query result `text`, or
+        the screen, and the captures)?"""
+        trx = lambda t: fill_template(t, {k: re.escape(v) for k, v in vals.items()})  # noqa
+        tv = lambda t: fill_template(t, vals)  # noqa: E731
+        rows = s.rows() if text is None else text.splitlines()
+        screen = "\n".join(rows)
+        for c in conds:
+            kb = s.keyboard_state()
+            if c.keyboard == "ready" and kb != "ready" or c.keyboard == "error" and kb != "error":
+                continue
+            if not all(self.mgr.guard.expect_matches(rows, tv(t)) for t in c.text):
+                continue
+            if any(self.mgr.guard.expect_matches(rows, tv(t)) for t in c.not_text):
+                continue
+            if not all(re.search(trx(rx), screen, re.M) for rx in c.regex):
+                continue
+            if not all(name in vals and re.search(trx(rx), vals[name], re.M)
+                       for name, rxs in c.captured.items() for rx in rxs):
+                continue
+            return True
+        return False
+
+    def _repeat(self, s: Session, flow: Flow, st: Step, vals: dict[str, str],
+                secrets: list[str], fail, ind: str) -> str:
+        """Do the step (press, query, or just look at the screen) until `until`
+        holds; stop at once when `fail_if` holds, or after `timeout`."""
+        rp = st.repeat
+        tv = lambda t: fill_template(t, vals)  # noqa: E731
+        deadline = time.monotonic() + rp.timeout
+        n = 0
+        try:
+            while True:
+                n += 1
+                text = None
+                if st.query:
+                    text = self._query(s, st, vals, fail)
+                else:
+                    expects = [tv(e) for e in (st.expect or st.when)]
+                    try:
+                        if st.press:
+                            ok = self.mgr.press(s, st.press, {tv(k): tv(v)
+                                                              for k, v in st.fill.items()},
+                                                tv(st.cursor) if st.cursor else None,
+                                                expects[0] if expects else None, None, True,
+                                                None, st.timeout, mask=secrets)
+                            if not ok:
+                                raise fail(st, "the host didn't answer within %gs" % st.timeout)
+                        else:
+                            s.wait(min(rp.every, 5.0))
+                    except GuardError as e:
+                        raise fail(st, str(e)) from None
+                    self._capture(s, st, vals, fail)
+                if self._holds(s, rp.until, vals, text):
+                    break
+                if rp.fail_if and self._holds(s, rp.fail_if, vals, text):
+                    raise fail(st, "stopped: the fail_if condition holds (attempt %d)%s" % (
+                        n, self._shown(st, vals)))
+                if time.monotonic() + rp.every > deadline:
+                    raise fail(st, "still not done after %gs (%d attempts)%s" % (
+                        rp.timeout, n, self._shown(st, vals)))
+                with s.cond:
+                    s.flow_status = "%s/%s: attempt %d, next in %gs%s" % (
+                        flow.name, st.label, n, rp.every, self._shown(st, vals))
+                    s.cond.notify_all()
+                time.sleep(rp.every)
+        finally:
+            with s.cond:
+                s.flow_status = None
+        self._check(s, st, vals, fail, text=text, captured_already=True)
+        return "done after %d attempt%s" % (n, "" if n == 1 else "s")
+
+    @staticmethod
+    def _shown(st: Step, vals: dict[str, str]) -> str:
+        caps = ["%s=%s" % (k, vals.get(k, "?")) for k in st.capture]
+        return "; last: " + ", ".join(caps) if caps else ""
+
+    def _capture(self, s: Session, st: Step, vals: dict[str, str], fail) -> None:
+        """Screen captures of a step (regex, field or rows)."""
+        tv = lambda t: fill_template(t, vals)  # noqa: E731
+        trx = lambda t: fill_template(t, {k: re.escape(v) for k, v in vals.items()})  # noqa
+        rows = s.rows()
+        screen = "\n".join(rows)
+        for name, c in st.capture.items():
+            if isinstance(c, str):
+                m = re.search(trx(c), screen, re.M)
+                if m:
+                    vals[name] = m.group(1).strip()
+            elif "rows" in c:
+                m = re.fullmatch(r"\s*(\d+)\s*(?:-\s*(\d+))?\s*", str(c["rows"]))
+                a, b = int(m.group(1)), int(m.group(2) or m.group(1))
+                vals[name] = "\n".join(r.rstrip() for r in rows[a - 1:b]).strip("\n")
+            else:
+                try:
+                    g = s.resolve(tv(str(c["field"])))
+                except FieldError:
+                    continue
+                if not g[0].hidden:
+                    vals[name] = s.buf.field_text(g, s.cp).strip()
+
+    def _check(self, s: Session, st: Step, vals: dict[str, str], fail,
+               text: str | None = None, captured_already: bool = False) -> None:
         tv = lambda t: fill_template(t, vals)  # noqa: E731
         # in regexes, substituted values match literally
         trx = lambda t: fill_template(t, {k: re.escape(v) for k, v in vals.items()})  # noqa
-        kb = s.keyboard_state()
-        want = st.check.keyboard
-        if kb == "disconnected":
-            raise fail(st, "the session disconnected")
-        if want is None and kb == "error":
-            raise fail(st, "operator error: %r" % s.snapshot()["message_line"])
-        if want == "ready" and kb != "ready":
-            raise fail(st, "keyboard is %s, expected ready" % kb)
-        if want == "error" and kb != "error":
-            raise fail(st, "expected an operator error, keyboard is %s" % kb)
-        rows = s.rows()
+        if text is None:                     # a screen step (a query step leaves the screen)
+            kb = s.keyboard_state()
+            want = st.check.keyboard
+            if kb == "disconnected":
+                raise fail(st, "the session disconnected")
+            if want is None and kb == "error":
+                raise fail(st, "operator error: %r" % s.snapshot()["message_line"])
+            if want == "ready" and kb != "ready":
+                raise fail(st, "keyboard is %s, expected ready" % kb)
+            if want == "error" and kb != "error":
+                raise fail(st, "expected an operator error, keyboard is %s" % kb)
+        where = "on the screen" if text is None else "in the query result"
+        rows = s.rows() if text is None else text.splitlines()
         screen = "\n".join(rows)
         for t in st.check.text:
             if not self.mgr.guard.expect_matches(rows, tv(t)):
-                raise fail(st, "check failed: %r is not on the screen" % tv(t))
+                raise fail(st, "check failed: %r is not %s" % (tv(t), where))
         for t in st.check.not_text:
             if self.mgr.guard.expect_matches(rows, tv(t)):
-                raise fail(st, "check failed: %r is on the screen" % tv(t))
+                raise fail(st, "check failed: %r is %s" % (tv(t), where))
         for rx in st.check.regex:
             if not re.search(trx(rx), screen, re.M):
                 raise fail(st, "check failed: no match for /%s/" % trx(rx))
@@ -880,6 +1102,8 @@ class FlowRunner:
                 if not re.search(trx(rx), vals[name], re.M):
                     raise fail(st, "check failed: %s doesn't match /%s/; it is:\n%s"
                                % (name, trx(rx), vals[name]))
+        if text is not None or captured_already:
+            return                           # query steps and repeats captured already
         for name, c in st.capture.items():
             if isinstance(c, str):
                 m = re.search(trx(c), screen, re.M)
