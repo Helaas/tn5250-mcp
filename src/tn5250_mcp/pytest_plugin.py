@@ -19,7 +19,7 @@ import os
 
 import pytest
 
-from .flows import FlowSet
+from .flows import FlowError, FlowSet
 from .terminal import Terminal, TerminalError
 
 
@@ -27,6 +27,11 @@ def pytest_addoption(parser):
     g = parser.getgroup("tn5250", "IBM i 5250 sessions (tn5250-mcp)")
     g.addoption("--t5250-host", default=os.environ.get("T5250_HOST"),
                 help="IBM i host ($T5250_HOST); tests using t5250 are skipped without it")
+    g.addoption("--t5250-profile", default=os.environ.get("T5250_PROFILE"),
+                help="saved connection profile instead of a host ($T5250_PROFILE)")
+    g.addoption("--t5250-profiles", action="append",
+                default=[x for x in os.environ.get("T5250_PROFILES", "").split(os.pathsep) if x],
+                help="profiles file or folder ($T5250_PROFILES, default ./profiles.yaml)")
     g.addoption("--t5250-port", type=int, default=int(os.environ.get("T5250_PORT", "992")))
     g.addoption("--t5250-no-tls", action="store_true",
                 default=os.environ.get("T5250_TLS") == "0")
@@ -56,25 +61,35 @@ def t5250(request, t5250_flows):
     at the end."""
     cfg = request.config
     host = cfg.getoption("--t5250-host")
-    if not host:
-        pytest.skip("no IBM i host: set $T5250_HOST or --t5250-host")
+    profile = cfg.getoption("--t5250-profile")
+    if not host and not profile:
+        pytest.skip("no IBM i host: set $T5250_HOST or $T5250_PROFILE (--t5250-host/-profile)")
     viewer_port = cfg.getoption("--t5250-viewer-port")
     if not os.environ.get("T5250_PASSWORD") and viewer_port is None:
         pytest.skip("no credentials: set $T5250_USER/$T5250_PASSWORD, or "
                     "--t5250-viewer-port to sign on by hand")
-    t = Terminal(host, cfg.getoption("--t5250-port"), tls=not cfg.getoption("--t5250-no-tls"),
-                 verify_tls=not cfg.getoption("--t5250-insecure"), flows=t5250_flows,
-                 log_dir=cfg.getoption("--t5250-log-dir"), viewer_port=viewer_port)
-    t.connect()
+    common = dict(flows=t5250_flows, log_dir=cfg.getoption("--t5250-log-dir"),
+                  viewer_port=viewer_port)
+    if profile:
+        t = Terminal.from_profile(profile, cfg.getoption("--t5250-profiles") or
+                                  ["profiles.yaml"], **common)
+    else:
+        t = Terminal(host, cfg.getoption("--t5250-port"),
+                     tls=not cfg.getoption("--t5250-no-tls"),
+                     verify_tls=not cfg.getoption("--t5250-insecure"), **common)
+    t.connect(run_after_connect=False)
+    rep = cfg.pluginmanager.get_plugin("terminalreporter")
+    say = (lambda m: rep.write_line(m)) if rep else print
     try:
-        if t.on_signon():
+        if t.profile and t.profile.after_connect:
+            t.run_after_connect(wait_for_viewer=600 if viewer_port is not None else 0,
+                                announce=say)
+        elif t.on_signon():
             if os.environ.get("T5250_PASSWORD"):
                 t.signon()
             else:
-                rep = cfg.pluginmanager.get_plugin("terminalreporter")
-                say = (lambda m: rep.write_line(m)) if rep else print
                 t.signon_in_viewer(announce=say)
-    except TerminalError:
+    except (TerminalError, FlowError):
         t.close()
         raise
     yield t

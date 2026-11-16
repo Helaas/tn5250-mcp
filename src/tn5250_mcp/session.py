@@ -128,6 +128,8 @@ class Session:
         self.reconnects = 0
         self.last_reconnect: float | None = None   # wall clock of the last good reconnect
         self.recording_steps: int | None = None    # steps so far while a recorder runs
+        self.profile = None                        # the Profile it was opened with, if any
+        self.reconnect_note: str | None = None     # what happened after the last reconnect
 
     # ------------------------------------------------------------------ io
     def connect(self, timeout: float = 20.0) -> None:
@@ -850,6 +852,8 @@ class Session:
                 "reconnects": self.reconnects,
                 "last_reconnect": self.last_reconnect,
                 "recording": self.recording_steps,
+                "profile": self.profile.name if self.profile else None,
+                "reconnect_note": self.reconnect_note,
             }
 
     def cell_attrs(self) -> list[int]:

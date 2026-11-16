@@ -1,0 +1,18 @@
+# Saved connection profiles. The agent connects with {"profile": "pub400"}.
+# Never put passwords here: after_connect runs the signon flow, which asks for
+# the password in the viewer (or reads $T5250_PASSWORD when nobody watches).
+
+profiles:
+  pub400:
+    description: PUB400.COM, a free public IBM i for trying things out
+    host: pub400.com
+    port: 992
+    after_connect: {flow: signon, with: {user: MYUSER}}
+    on_reconnect: true          # sign on again when PUB400 drops an idle session
+
+  dev:
+    description: Example of a company development system (plain telnet, fixed device)
+    host: dev400.example.com
+    tls: false                  # port defaults to 23 without TLS
+    device_name: "AGENT*"       # AGENTA, AGENTB, ... one per connection
+    codepage: cp273

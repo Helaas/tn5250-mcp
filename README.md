@@ -64,7 +64,8 @@ claude mcp add --transport http tn5250 http://127.0.0.1:8250/mcp
 
 | tool | what it does |
 |---|---|
-| `connect` | open a session (`host`, `port` 992/23, `tls`, `device_name`, `wide` for 27x132, `codepage`) |
+| `connect` | open a session with a saved `profile`, or `host`, `port` 992/23, `tls`, `device_name`, `wide` for 27x132, `codepage` |
+| `list_profiles` | the saved connection profiles |
 | `get_screen` | screen text with rulers, cursor, keyboard state, `screen_id`, input-field table |
 | `fill` | put values into fields (by `"row,col"`, `"#index"` or label) without sending |
 | `press` | optional fills + cursor, then send a key and return the host's reply screen |
@@ -82,6 +83,48 @@ Example `press` call:
 { "key": "Enter", "expect": "1:WORK WITH DATA IN A FILE",
   "values": { "ID": "3", "NAME": "SPROCKET", "QTY": "-3" } }
 ```
+
+## Connection profiles
+
+Save the systems you use in a YAML file and start the server with
+`--profiles profiles.yaml` (a file or a folder). The agent then connects with
+`connect {"profile": "pub400"}` and never needs the host details.
+
+```yaml
+profiles:
+  pub400:
+    description: PUB400.COM, a free public IBM i
+    host: pub400.com
+    port: 992                         # tls: true is the default; port 23 without TLS
+    after_connect: {flow: signon, with: {user: MYUSER}}
+    on_reconnect: true                # sign on again after the host drops the session
+  dev:
+    host: dev400.example.com
+    tls: false
+    device_name: "AGENT*"             # AGENTA, AGENTB, ... (= is a random character)
+    codepage: cp273
+```
+
+Keys: `host` (required), `description`, `port`, `tls`, `verify_tls`,
+`device_name`, `wide`, `codepage`, `after_connect` (a flow name, or `{flow,
+with}`), `on_reconnect`. Profiles never hold passwords; a file with a
+`password` key is refused. Use a sign-on flow as `after_connect`: it asks for
+the password in the viewer, or reads it from the environment.
+
+- When the server starts it checks that every `after_connect` flow exists
+  and that its parameters are valid.
+- If the after-connect flow can't finish (for example nobody has the viewer
+  open), the session stays connected and `connect` says why.
+- After a reconnect the session asks for the same device name again, so the
+  host can hand back the same job (depending on `QDSCJOBITV`).
+- `--profiles-only` refuses `connect` with a host name, so the agent can only
+  reach the systems you saved.
+- Outside MCP: `Terminal.from_profile("pub400", "profiles.yaml", flows=[...])`,
+  `tn5250-run run --profile pub400 ...` and pytest `--t5250-profile pub400`.
+  When the sign-on flow needs a password that isn't in the environment, these
+  print the viewer link and wait for you.
+
+See [`examples/profiles.yaml`](examples/profiles.yaml).
 
 ## Screen flows
 
@@ -252,7 +295,8 @@ agent can run `signon`, and you type the password in the viewer.
   refused (full list in `src/tn5250_mcp/guard.py`). Add your own with `--block REGEX`. It's a
   seatbelt, not a security boundary: give the agent's user profile only the
   authority it needs.
-- **Host allow list.** `--allowed-hosts "dev400,*.test.example.com"`.
+- **Host allow list.** `--allowed-hosts "dev400,*.test.example.com"`, or
+  `--profiles-only` to allow only your saved connection profiles.
 - **Flows instead of free typing.** `--flows-only` removes `fill` and `press`, so
   the agent can read screens and run your flows, nothing else. `--read-only`
   also drops every flow not marked `read_only`.
@@ -325,6 +369,8 @@ listens on 127.0.0.1 and needs the random token, and it checks the Host header.
 | `--reconnect-attempts N` | `T5250_RECONNECT_ATTEMPTS` | `10`, `0` = off |
 | `--reconnect-interval SECONDS` | `T5250_RECONNECT_INTERVAL` | `5` |
 | `--record-dir DIR` | `T5250_RECORD_DIR` | recordings are returned, not saved |
+| `--profiles PATH` (repeatable) | `T5250_PROFILES` (`:`-separated) | none |
+| `--profiles-only` | `T5250_PROFILES_ONLY=1` | off |
 
 ## Examples and tests
 

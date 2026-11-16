@@ -18,6 +18,7 @@ from typing import Any
 from .flows import FlowError, FlowResult, FlowRunner, FlowSet
 from .guard import Guard
 from .manager import GuardError, Manager, render
+from .profiles import Profile, ProfileSet
 from .session import FieldError, Session
 
 _CONTINUE_SCREENS = ("Display Program Messages", "Press Enter to continue")
@@ -49,20 +50,64 @@ class Terminal:
         else:
             self.flows = FlowSet.load(list(flows))
         self.runner = FlowRunner(self.mgr, self.flows or FlowSet(), pace=pace)
+        self.mgr.flow_runner = self.runner
+        self.profile: Profile | None = None
         self._viewer_port = viewer_port
         self.s: Session | None = None
 
     # -- lifecycle ---------------------------------------------------------
-    def connect(self) -> "Terminal":
+    @classmethod
+    def from_profile(cls, name: str, profiles: str | list | ProfileSet = "profiles.yaml",
+                     **kw: Any) -> "Terminal":
+        """A Terminal for a saved connection profile. connect() then runs the
+        profile's after_connect flow (pass the flows that define it)."""
+        if not isinstance(profiles, ProfileSet):
+            profiles = ProfileSet.load([profiles] if isinstance(profiles, (str, os.PathLike))
+                                       else list(profiles))
+        p = profiles.get(name)
+        t = cls(p.host, p.port, tls=p.tls, verify_tls=p.verify_tls, wide=p.wide,
+                codepage=p.codepage or kw.pop("codepage", "cp037"), **kw)
+        t.profile = p
+        return t
+
+    def connect(self, run_after_connect: bool = True) -> "Terminal":
+        p = self.profile
         try:
             self.s = self.mgr.connect(self.name, self.host, self.port, self.tls,
-                                      self.verify_tls, self.device_name, self.wide, None,
-                                      self.timeout)
+                                      self.verify_tls,
+                                      p.next_device_name() if p else self.device_name,
+                                      self.wide, None, self.timeout)
         except GuardError as e:
             raise TerminalError(str(e)) from None
+        self.s.profile = p
         if self._viewer_port is not None:
             self.start_viewer(self._viewer_port)
+        if p and p.after_connect and run_after_connect:
+            self.run_after_connect()
         return self
+
+    def run_after_connect(self, wait_for_viewer: float = 0.0, announce=print) -> FlowResult:
+        """Run the profile's after_connect flow (e.g. sign-on). If it needs a
+        password that isn't in the environment, `wait_for_viewer` seconds are
+        given for a person to open the viewer and type it there."""
+        p = self.profile
+        if not p or not p.after_connect:
+            raise TerminalError("no after_connect flow (connect with a profile that has one)")
+        flow = (self.flows.flows if self.flows else {}).get(p.after_connect["flow"])
+        if not flow:
+            raise TerminalError("profile %s runs flow %r after connecting; load the flows that "
+                                "define it (flows=[...])" % (p.name, p.after_connect["flow"]))
+        missing = [sp for sp in flow.secrets(self.flows)
+                   if not (sp.env and os.environ.get(sp.env))]
+        if missing and wait_for_viewer and not self.mgr.viewer_watching(self.name):
+            url = self.start_viewer(self._viewer_port or 0)
+            announce("Open the viewer to type the password: %s" % url)
+            deadline = time.monotonic() + wait_for_viewer
+            while not self.mgr.viewer_watching(self.name):
+                if time.monotonic() > deadline:
+                    raise TerminalError("nobody opened the viewer within %gs" % wait_for_viewer)
+                time.sleep(0.5)
+        return self.runner.run(self.session, flow.name, dict(p.after_connect["with"]))
 
     def close(self) -> None:
         if self.s is not None and self.name in self.mgr.sessions:

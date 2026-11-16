@@ -28,10 +28,10 @@ def render(snap: dict, show_fields: bool = True) -> str:
         out.append("the host dropped the connection; reconnecting (%s). Call wait; the host "
                    "will show its sign-on screen." % snap["reconnecting"])
     elif snap.get("last_reconnect"):
-        out.append("reconnected at %s after the host dropped the connection (%d so far); the "
-                   "session started over at sign-on" % (
-                       _dt.datetime.fromtimestamp(snap["last_reconnect"]).strftime("%H:%M:%S"),
-                       snap["reconnects"]))
+        out.append("reconnected at %s after the host dropped the connection (%d so far); %s" % (
+            _dt.datetime.fromtimestamp(snap["last_reconnect"]).strftime("%H:%M:%S"),
+            snap["reconnects"], snap.get("reconnect_note")
+            or "the session started over at sign-on"))
     if snap.get("recording") is not None:
         out.append("RECORDING a flow: %d steps so far (record_stop to save it)"
                    % snap["recording"])
@@ -90,6 +90,7 @@ class Manager:
         self.record_dir = record_dir
         self.recorders: dict = {}                   # session -> Recorder
         self.name_taken = lambda name: False        # set by the MCP server: tool names in use
+        self.flow_runner = None                     # runs profiles' after_connect flows
         self.on_recorded = None                     # set by the MCP server: register a flow
         self.log_dir = log_dir
         self.default_codepage = default_codepage
@@ -199,6 +200,32 @@ class Manager:
         s.wait(timeout=timeout)
         return s
 
+    # -- profiles --------------------------------------------------------------
+    def connect_profile(self, name: str, profile, timeout: float = 20.0):
+        """Connect with a saved profile, then run its after_connect flow. A flow
+        that doesn't finish leaves the session connected; the note says why."""
+        s = self.connect(name, profile.host, profile.port, profile.tls, profile.verify_tls,
+                         profile.next_device_name(), profile.wide, profile.codepage, timeout)
+        s.profile = profile
+        s.log("profile", profile.summary())
+        note = self.run_after_connect(s) if profile.after_connect else None
+        return s, note
+
+    def run_after_connect(self, s: Session) -> str:
+        from .flows import FlowError
+        p = s.profile
+        flow = p.after_connect["flow"]
+        if self.flow_runner is None or flow not in self.flow_runner.flows.flows:
+            return "profile %s wants to run %s after connecting, but that flow isn't loaded" \
+                % (p.name, flow)
+        try:
+            self.flow_runner.run(s, flow, dict(p.after_connect["with"]))
+        except FlowError as e:
+            s.log("after connect", "%s did not finish: %s" % (flow, e.args[0]))
+            return "%s (profile %s) did not finish: %s" % (flow, p.name, e.args[0])
+        s.log("after connect", "%s finished" % flow)
+        return "%s (profile %s) finished" % (flow, p.name)
+
     # -- reconnect -------------------------------------------------------------
     def _dropped(self, s: Session) -> None:
         """The host closed the connection (line drop, idle timeout, ENDCNN).
@@ -236,8 +263,19 @@ class Manager:
                 s.reconnecting = None
                 s.reconnects += 1
                 s.last_reconnect = time.time()
+                s.reconnect_note = None
                 s.cond.notify_all()
             s.log("reconnect", "attempt %d of %d: connected" % (i, n))
+            p = s.profile
+            if p and p.on_reconnect and p.after_connect:
+                with s.cond:
+                    s.reconnect_note = "running %s (profile %s) again; call wait" % (
+                        p.after_connect["flow"], p.name)
+                s.wait(timeout=20.0)
+                note = self.run_after_connect(s)
+                with s.cond:
+                    s.reconnect_note = note
+                    s.cond.notify_all()
             return
         with s.cond:
             s.reconnecting = None

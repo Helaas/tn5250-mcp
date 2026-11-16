@@ -17,12 +17,15 @@ from pydantic import Field
 from .flows import Flow, FlowConfigError, FlowError, FlowRunner, FlowSet
 from .guard import DEFAULT_BLOCKED, Guard
 from .manager import GuardError, Manager, render
+from .profiles import ProfileError, ProfileSet
 from .session import ALL_KEYS
 
 INSTRUCTIONS = """\
 Drive IBM i (AS/400) 5250 green-screen sessions.
 
 Workflow: connect -> get_screen -> fill / press -> read the screen that press returns.
+- connect with a saved profile ({"profile": name}; list_profiles shows them) when
+  there are any; a profile may sign on by itself after connecting.
 - Every fill/press must carry `expect` (text that must be on the current screen,
   or "row:text") or `screen_id` (from the last screen you read). If the screen
   changed - because the host moved on or the human typed in the viewer - the
@@ -48,7 +51,7 @@ Workflow: connect -> get_screen -> fill / press -> read the screen that press re
 """
 
 BUILTIN_TOOLS = {"connect", "disconnect", "list_sessions", "get_screen", "fill", "press",
-                 "wait", "viewer", "keys", "record_start", "record_stop"}
+                 "wait", "viewer", "keys", "record_start", "record_stop", "list_profiles"}
 
 Session_ = Annotated[str, Field(description="session name; lets you run several side by side")]
 
@@ -103,16 +106,19 @@ def _flow_description(f: Flow, flows: FlowSet) -> str:
 
 def build_server(mgr: Manager, flows: FlowSet | None = None,
                  toolsets: list[str] | None = None, flows_only: bool = False,
-                 read_only: bool = False, pace: float = 0.0) -> MCPServer:
+                 read_only: bool = False, pace: float = 0.0,
+                 profiles: ProfileSet | None = None, profiles_only: bool = False) -> MCPServer:
     mcp = MCPServer("tn5250", instructions=INSTRUCTIONS, version="0.4.0")
     flows = flows if flows is not None else FlowSet()
     runner = FlowRunner(mgr, flows, pace=pace)
+    mgr.flow_runner = runner
+    profiles = profiles if profiles is not None else ProfileSet()
     mgr.name_taken = lambda n: n in BUILTIN_TOOLS or n in flows.flows
 
     async def run(fn, *a, **k):
         try:
             return await anyio.to_thread.run_sync(lambda: fn(*a, **k))
-        except (GuardError, FlowError) as e:
+        except (GuardError, FlowError, ProfileError) as e:
             raise ToolError(str(e)) from None
         except (OSError, ConnectionError) as e:
             raise ToolError("connection problem: %s" % e) from None
@@ -124,21 +130,57 @@ def build_server(mgr: Manager, flows: FlowSet | None = None,
     @mcp.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False,
                                           open_world_hint=True))
     async def connect(
-        host: Annotated[str, Field(description="IBM i host name, e.g. pub400.com")],
-        port: Annotated[int, Field(description="992 for TLS, 23 for plain telnet")] = 992,
-        tls: bool = True,
+        profile: Annotated[str | None, Field(
+            description="saved connection profile (see list_profiles); then leave out the "
+                        "connection details")] = None,
+        host: Annotated[str | None, Field(
+            description="IBM i host name, e.g. pub400.com (when not using a profile)")] = None,
+        port: Annotated[int | None, Field(
+            description="992 for TLS (default), 23 for plain telnet")] = None,
+        tls: bool | None = None,
         session: Session_ = "main",
-        verify_tls: bool = True,
+        verify_tls: bool | None = None,
         device_name: Annotated[str | None, Field(
             description="ask for a specific display device name")] = None,
-        wide: Annotated[bool, Field(description="27x132 display (3477) instead of 24x80")] = False,
+        wide: Annotated[bool | None, Field(
+            description="27x132 display (3477) instead of 24x80")] = None,
         codepage: Annotated[str | None, Field(
             description="EBCDIC code page, e.g. cp037 (US), cp273 (DE), cp500 (intl)")] = None,
     ) -> str:
-        """Open a 5250 session and return the first screen (usually Sign On)."""
-        s = await run(mgr.connect, session, host, port, tls, verify_tls, device_name, wide,
-                      codepage, 20.0)
-        return render(s.snapshot()) + viewer_hint()
+        """Open a 5250 session and return the first screen: Sign On, or the screen
+        after the profile's after-connect flow (e.g. a menu once signed on)."""
+        details = {k: v for k, v in dict(host=host, port=port, tls=tls, verify_tls=verify_tls,
+                                         device_name=device_name, wide=wide,
+                                         codepage=codepage).items() if v is not None}
+        note = None
+        if profile:
+            if details:
+                raise ToolError("connect with either a profile or connection details, not "
+                                "both (profile %s already has: %s)" % (
+                                    profile, ", ".join(sorted(details))))
+            p = await run(profiles.get, profile)
+            s, note = await run(mgr.connect_profile, session, p, 20.0)
+        else:
+            if profiles_only:
+                raise ToolError("this server only connects through saved profiles: %s" % (
+                    ", ".join(profiles.profiles) or "none configured"))
+            if not host:
+                raise ToolError("give a profile (%s) or a host" % (
+                    ", ".join(profiles.profiles) or "no profiles configured"))
+            use_tls = True if tls is None else tls
+            s = await run(mgr.connect, session, host, port or (992 if use_tls else 23), use_tls,
+                          True if verify_tls is None else verify_tls, device_name, bool(wide),
+                          codepage, 20.0)
+        head = ("%s\n" % note) if note else ""
+        return head + render(s.snapshot()) + viewer_hint()
+
+    @mcp.tool(annotations=ToolAnnotations(read_only_hint=True))
+    async def list_profiles() -> str:
+        """List the saved connection profiles you can connect with."""
+        if not profiles.profiles:
+            return "no saved profiles (the server was started without --profiles)"
+        return "\n".join(p.summary() for p in profiles.profiles.values()) + (
+            "\n(only profiles can be used to connect)" if profiles_only else "")
 
     @mcp.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False,
                                           idempotent_hint=True))
@@ -373,6 +415,13 @@ def main(argv: list[str] | None = None) -> None:
                    help="seconds between reconnect attempts")
     p.add_argument("--record-dir", default=os.environ.get("T5250_RECORD_DIR"),
                    help="folder where record_stop saves recorded flows")
+    p.add_argument("--profiles", action="append",
+                   default=[x for x in os.environ.get("T5250_PROFILES", "").split(os.pathsep)
+                            if x],
+                   help="YAML file or folder of saved connection profiles (repeatable)")
+    p.add_argument("--profiles-only", action="store_true",
+                   default=os.environ.get("T5250_PROFILES_ONLY") == "1",
+                   help="connect only through saved profiles (no free host names)")
     p.add_argument("--flows", action="append",
                    default=[x for x in os.environ.get("T5250_FLOWS", "").split(os.pathsep) if x],
                    help="YAML file or folder of screen flows to offer as tools (repeatable)")
@@ -414,8 +463,13 @@ def main(argv: list[str] | None = None) -> None:
 
     toolsets = [t.strip() for t in a.toolsets.split(",") if t.strip()] or None
     try:
-        server = build_server(mgr, flowset, toolsets, a.flows_only, a.read_only, a.pace)
-    except FlowConfigError as e:
+        profileset = ProfileSet.load(a.profiles) if a.profiles else None
+        server = build_server(mgr, flowset, toolsets, a.flows_only, a.read_only, a.pace,
+                              profileset, a.profiles_only)
+        if profileset:
+            profileset.validate_flows(flowset, mgr.flow_runner)
+            print("tn5250-mcp: profiles: %s" % ", ".join(profileset.profiles), file=sys.stderr)
+    except (FlowConfigError, ProfileError) as e:
         p.exit(2, "tn5250-mcp: %s\n" % e)
     if flowset:
         offered = [f.name for f in flowset.select(toolsets, a.read_only,

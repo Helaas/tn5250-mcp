@@ -19,6 +19,7 @@ import sys
 
 from .flows import FlowConfigError, FlowError, FlowSet
 from .guard import DEFAULT_BLOCKED, Guard
+from .profiles import ProfileError
 from .terminal import Terminal, TerminalError
 
 
@@ -60,22 +61,36 @@ def cmd_run(a) -> int:
     params = _parse_params(a.params)
     guard = Guard(require_check=False,
                   blocked=([] if a.no_default_blocks else list(DEFAULT_BLOCKED)) + a.block)
-    t = Terminal(a.host, a.port, tls=not a.no_tls, verify_tls=not a.insecure, flows=fs,
-                 device_name=a.device_name, codepage=a.codepage, log_dir=a.log_dir,
-                 guard=guard, viewer_port=a.viewer_port, pace=a.pace)
+    common = dict(flows=fs, log_dir=a.log_dir, guard=guard, viewer_port=a.viewer_port,
+                  pace=a.pace)
+    if a.profile:
+        try:
+            t = Terminal.from_profile(a.profile, a.profiles or ["profiles.yaml"], **common)
+        except ProfileError as e:
+            print("profile: %s" % e, file=sys.stderr)
+            return 2
+    elif a.host:
+        t = Terminal(a.host, a.port, tls=not a.no_tls, verify_tls=not a.insecure,
+                     device_name=a.device_name, codepage=a.codepage, **common)
+    else:
+        print("give --host or --profile", file=sys.stderr)
+        return 2
+    say = lambda m: print(m, file=sys.stderr)  # noqa: E731
     try:
-        t.connect()
+        t.connect(run_after_connect=False)
         if a.viewer_port is not None:
             print("viewer: %s" % t.viewer_url, file=sys.stderr)
         mode = a.signon
         if mode == "auto":
             mode = "env" if os.environ.get("T5250_PASSWORD") else "viewer"
-        if mode != "none" and t.on_signon():
+        if mode != "none" and t.profile and t.profile.after_connect:
+            t.run_after_connect(wait_for_viewer=600 if mode == "viewer" else 0, announce=say)
+        elif mode != "none" and t.on_signon():
             if mode == "env":
                 t.signon()
             else:
                 t.signon_in_viewer(announce=lambda m: print(m, file=sys.stderr))
-    except (TerminalError, OSError) as e:
+    except (TerminalError, FlowError, OSError) as e:
         print("could not get a signed-on session: %s" % e, file=sys.stderr)
         t.close()
         return 3
@@ -126,8 +141,13 @@ def main(argv: list[str] | None = None) -> None:
     r.add_argument("params", nargs="*", metavar="name=value")
     r.add_argument("--flows", action="append", default=[],
                    help="YAML file or folder (repeatable; default $T5250_FLOWS)")
-    r.add_argument("--host", default=os.environ.get("T5250_HOST"), required=not
-                   os.environ.get("T5250_HOST"))
+    r.add_argument("--host", default=os.environ.get("T5250_HOST"))
+    r.add_argument("--profile", default=os.environ.get("T5250_PROFILE"),
+                   help="saved connection profile (instead of --host and friends)")
+    r.add_argument("--profiles", action="append",
+                   default=[x for x in os.environ.get("T5250_PROFILES", "").split(os.pathsep)
+                            if x],
+                   help="profiles file or folder (default ./profiles.yaml, $T5250_PROFILES)")
     r.add_argument("--port", type=int, default=int(os.environ.get("T5250_PORT", "992")))
     r.add_argument("--no-tls", action="store_true", default=os.environ.get("T5250_TLS") == "0")
     r.add_argument("--insecure", action="store_true",
