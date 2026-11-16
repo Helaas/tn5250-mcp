@@ -16,6 +16,8 @@ import com.ibm.as400.access.AS400Message;
 import com.ibm.as400.access.AS400Exception;
 import com.ibm.as400.access.AS400SecurityException;
 import com.ibm.as400.access.CharConverter;
+import com.ibm.as400.access.CommandCall;
+import com.ibm.as400.access.Job;
 import com.ibm.as400.access.IFSFile;
 import com.ibm.as400.access.IFSFileInputStream;
 import com.ibm.as400.access.IFSFileOutputStream;
@@ -49,6 +51,10 @@ public class T5250Helper {
         AS400 system;
         Connection readOnly;
         Connection readWrite;
+        Connection internal;          // only for statements this helper builds itself
+        List<String> libl;            // library list for SQL and commands (null: the user's)
+        CommandCall cmd;              // one remote command job, kept for the connection
+        List<String> cmdLibl;         // library list currently set in that job
     }
 
     static final Map<String, Conn> CONNS = new LinkedHashMap<>();
@@ -104,6 +110,9 @@ public class T5250Helper {
             case "ping": return "pong";
             case "connect": return connect(r);
             case "change_password": return changePassword(r);
+            case "command": return command(r);
+            case "read_member": return readMember(r);
+            case "spooled_file": return spooledFile(r);
             case "close": {
                 Conn c = CONNS.remove(str(r, "name"));
                 if (c != null) close(c);
@@ -132,6 +141,7 @@ public class T5250Helper {
         sys.connectService(AS400.SIGNON);    // fails here on a wrong user or password
         Conn c = new Conn();
         c.system = sys;
+        c.libl = strings(r.get("libl"));
         CONNS.put(name, c);
         Map<String, Object> res = new LinkedHashMap<>();
         res.put("user", sys.getUserId());
@@ -175,6 +185,8 @@ public class T5250Helper {
         // read only: the database server itself refuses anything but queries
         p.setProperty("access", write ? "all" : "read only");
         p.setProperty("naming", "system");   // MYLIB/TABLE, and the library list
+        if (c.libl != null && !c.libl.isEmpty())
+            p.setProperty("libraries", String.join(",", c.libl));
         p.setProperty("errors", "full");
         p.setProperty("prompt", "false");
         p.setProperty("date format", "iso");
@@ -231,6 +243,132 @@ public class T5250Helper {
             }
             return res;
         }
+    }
+
+    /** Run a CL command in the connection's remote command job (library list
+     *  set first when asked for). Returns the messages, not just ok/failed. */
+    static Object command(Map<String, Object> r) throws Exception {
+        Conn c = conn(r);
+        if (c.cmd == null) {
+            c.cmd = new CommandCall(c.system);
+            c.cmd.setThreadSafe(false);       // always the same server job: libl stays set
+        }
+        List<String> want = strings(r.get("libl"));
+        if (want == null) want = c.libl;
+        Map<String, Object> res = new LinkedHashMap<>();
+        if (want != null && !want.isEmpty() && !want.equals(c.cmdLibl)) {
+            if (!c.cmd.run("CHGLIBL LIBL(" + String.join(" ", want) + ")")) {
+                res.put("ok", false);
+                res.put("messages", messages(c.cmd.getMessageList()));
+                res.put("step", "CHGLIBL");
+                res.put("job", jobName(c.cmd.getServerJob()));
+                return res;
+            }
+            c.cmdLibl = want;
+        }
+        boolean ok = c.cmd.run(str(r, "command"));
+        res.put("ok", ok);
+        res.put("messages", messages(c.cmd.getMessageList()));
+        res.put("job", jobName(c.cmd.getServerJob()));
+        res.put("libl", c.cmdLibl);
+        return res;
+    }
+
+    static String jobName(Job j) {
+        return j.getNumber() + "/" + j.getUser().trim() + "/" + j.getName().trim();
+    }
+
+    static List<Object> messages(AS400Message[] list) {
+        List<Object> out = new ArrayList<>();
+        if (list == null) return out;
+        for (AS400Message m : list) {
+            Map<String, Object> mm = new LinkedHashMap<>();
+            mm.put("id", m.getID());
+            mm.put("severity", m.getSeverity());
+            mm.put("type", m.getType());
+            mm.put("text", m.getText());
+            out.add(mm);
+        }
+        return out;
+    }
+
+    static List<String> strings(Object o) {
+        if (!(o instanceof List)) return null;
+        List<String> out = new ArrayList<>();
+        for (Object x : (List<?>) o) out.add(String.valueOf(x));
+        return out;
+    }
+
+    /** A connection for this helper's own fixed statements (aliases in QTEMP,
+     *  spooled file reads); never for SQL that comes from the caller. */
+    static Connection internal(Conn c) throws SQLException {
+        if (c.internal != null && !c.internal.isClosed()) return c.internal;
+        Properties p = new Properties();
+        p.setProperty("naming", "system");
+        p.setProperty("errors", "full");
+        p.setProperty("prompt", "false");
+        // e.g. compiler event files are CCSID 65535: read them as text, not hex
+        p.setProperty("translate binary", "true");
+        c.internal = new AS400JDBCDriver().connect(c.system, p, null);
+        c.internal.setAutoCommit(true);
+        return c.internal;
+    }
+
+    static String sysName(Map<String, Object> r, String k) {
+        String v = str(r, k).toUpperCase();
+        if (!v.matches("[A-Z$#@][A-Z0-9_$#@.]{0,9}"))
+            throw new IllegalArgumentException("not an object name: " + v);
+        return v;
+    }
+
+    /** Records of a database file member (e.g. a compiler event file). */
+    static Object readMember(Map<String, Object> r) throws Exception {
+        Conn c = conn(r);
+        String lib = sysName(r, "lib"), file = sysName(r, "file"), mbr = sysName(r, "member");
+        int max = num(r, "max_records", 20000);
+        List<Object> recs = new ArrayList<>();
+        try (Statement st = internal(c).createStatement()) {
+            st.execute("CREATE OR REPLACE ALIAS QTEMP/T5250MBR FOR " + lib + "/" + file + " (" + mbr + ")");
+            try (ResultSet rs = st.executeQuery("SELECT * FROM QTEMP/T5250MBR")) {
+                int n = rs.getMetaData().getColumnCount();
+                while (rs.next() && recs.size() < max) {
+                    StringBuilder sb = new StringBuilder();
+                    for (int i = 1; i <= n; i++) {
+                        String v = rs.getString(i);
+                        if (v != null) sb.append(v);
+                    }
+                    recs.add(rtrim(sb.toString()));
+                }
+            }
+        }
+        Map<String, Object> res = new LinkedHashMap<>();
+        res.put("records", recs);
+        return res;
+    }
+
+    /** Lines of a spooled file (SYSTOOLS.SPOOLED_FILE_DATA). */
+    static Object spooledFile(Map<String, Object> r) throws Exception {
+        Conn c = conn(r);
+        int max = num(r, "max_lines", 5000);
+        List<Object> lines = new ArrayList<>();
+        try (PreparedStatement ps = internal(c).prepareStatement(
+                "SELECT SPOOLED_DATA FROM TABLE(SYSTOOLS.SPOOLED_FILE_DATA("
+                + "JOB_NAME => CAST(? AS VARCHAR(28)), SPOOLED_FILE_NAME => CAST(? AS VARCHAR(10)), "
+                + "SPOOLED_FILE_NUMBER => CAST(? AS VARCHAR(6)))) X ORDER BY ORDINAL_POSITION")) {
+            ps.setString(1, str(r, "job"));
+            ps.setString(2, str(r, "file").toUpperCase());
+            ps.setString(3, String.valueOf(r.getOrDefault("number", "*LAST")));
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next() && lines.size() < max) {
+                    String v = rs.getString(1);
+                    lines.add(v == null ? "" : rtrim(v));
+                }
+            }
+        }
+        Map<String, Object> res = new LinkedHashMap<>();
+        res.put("lines", lines);
+        res.put("truncated", lines.size() >= max);
+        return res;
     }
 
     static IFSFile ifs(Map<String, Object> r) {
@@ -340,7 +478,7 @@ public class T5250Helper {
 
     // -- helpers ----------------------------------------------------------------
     static void close(Conn c) {
-        for (Connection x : new Connection[]{c.readOnly, c.readWrite}) {
+        for (Connection x : new Connection[]{c.readOnly, c.readWrite, c.internal}) {
             try { if (x != null) x.close(); } catch (Exception ignored) { }
         }
         try { c.system.disconnectAllServices(); } catch (Exception ignored) { }

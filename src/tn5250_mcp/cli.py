@@ -1,4 +1,5 @@
-"""tn5250-run: check and run screen flows from a shell or CI, no MCP client.
+"""tn5250-run: check and run screen flows, run CL commands and compile, from a
+shell or CI, no MCP client.
 
     tn5250-run check flows/
     tn5250-run run --host pub400.com --flows flows/ data_entry_test lib=MYLIB
@@ -127,10 +128,109 @@ def cmd_run(a) -> int:
     return code
 
 
+def _host(a, **policy):
+    """A host-server connection for cmd/compile: profile or --host/--user;
+    password from the keychain, $T5250_PASSWORD, or a prompt (a person at a
+    terminal). An expired or rejected password is not retried."""
+    import getpass
+    from .credentials import CredentialStore
+    from .hostservers import HostServers
+    from .profiles import ProfileSet
+    host, user, tls, libl = a.host, a.user, not a.no_tls, a.libl
+    if a.profile:
+        p = ProfileSet.load(a.profiles or ["profiles.yaml"]).get(a.profile)
+        host, user, tls = p.host, user or p.user, p.tls
+        libl = libl or (",".join(p.libl) if p.libl else None)
+    if not host or not user:
+        raise SystemExit("give --profile, or --host and --user")
+    if not a.jt400:
+        raise SystemExit("give --jt400 /path/to/jt400.jar (JTOpen) or set $T5250_JT400")
+    creds = CredentialStore(keychain=True)
+    pw = creds.get(host, user) or os.environ.get("T5250_PASSWORD")
+    if not pw:
+        if not sys.stdin.isatty():
+            raise SystemExit("no password: set $T5250_PASSWORD, or run in a terminal")
+        pw = getpass.getpass("IBM i password for %s on %s: " % (user.upper(), host))
+    hs = HostServers(a.jt400, a.java, guard=Guard(), **policy)
+    hs.connect("cli", host, user, pw, tls, [x for x in (libl or "").split(",") if x] or None)
+    return hs
+
+
+def cmd_cmd(a) -> int:
+    from .hostservers import HostServerError
+    try:
+        hs = _host(a, allow_commands=True)
+        res = hs.command("cli", a.command)
+    except HostServerError as e:
+        print("FAILED %s" % e, file=sys.stderr)
+        return 3
+    if a.json:
+        print(json.dumps(res))
+    else:
+        for m in res.get("messages", []):
+            print("%s (severity %s) %s" % (m.get("id") or "-", m.get("severity"), m.get("text")))
+        print("%s (job %s)" % ("ok" if res["ok"] else "FAILED", res.get("job")), file=sys.stderr)
+    hs.close()
+    return 0 if res["ok"] else 1
+
+
+def cmd_compile(a) -> int:
+    from .hostservers import HostServerError
+    try:
+        hs = _host(a, compile_libs=["*"])
+        res = hs.compile("cli", a.source, a.object, a.type, a.options or "")
+    except HostServerError as e:
+        print("FAILED %s" % e, file=sys.stderr)
+        return 3
+    if a.json:
+        print(json.dumps(res))
+    else:
+        for d in res["diagnostics"]:
+            print("%s:%d:%d: %s %d %s %s" % (d["file"], d["line"], d["column"],
+                                             d["severity_name"], d["severity"], d["id"],
+                                             d["text"]))
+        for m in res["messages"]:
+            if (m.get("severity") or 0) >= 10:
+                print("%s (severity %s) %s" % (m.get("id"), m.get("severity"), m.get("text")),
+                      file=sys.stderr)
+        if res.get("note"):
+            print("note: %s" % res["note"], file=sys.stderr)
+        print("%s %s" % ("compiled" if res["ok"] else "FAILED", res["object"]), file=sys.stderr)
+    hs.close()
+    return 0 if res["ok"] else 1
+
+
+def _host_args(x) -> None:
+    x.add_argument("--profile", default=os.environ.get("T5250_PROFILE"))
+    x.add_argument("--profiles", action="append",
+                   default=[v for v in os.environ.get("T5250_PROFILES", "").split(os.pathsep)
+                            if v])
+    x.add_argument("--host", default=os.environ.get("T5250_HOST"))
+    x.add_argument("--user", default=os.environ.get("T5250_USER"))
+    x.add_argument("--no-tls", action="store_true", default=os.environ.get("T5250_TLS") == "0")
+    x.add_argument("--libl", help="library list, comma separated (default: the profile's)")
+    x.add_argument("--jt400", default=os.environ.get("T5250_JT400"))
+    x.add_argument("--java", default=os.environ.get("T5250_JAVA"))
+    x.add_argument("--json", action="store_true")
+
+
 def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser(prog="tn5250-run", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
+
+    k = sub.add_parser("cmd", help="run a CL command through the host servers")
+    k.add_argument("command")
+    _host_args(k)
+    k.set_defaults(fn=cmd_cmd)
+
+    m = sub.add_parser("compile", help="compile a source and print its errors")
+    m.add_argument("source", help="IFS path, or LIB/FILE(MEMBER)")
+    m.add_argument("object", help="LIB/NAME to create")
+    m.add_argument("--type", help="rpg, sqlrpg, rpgmod, sqlrpgmod, cl, clmod, dspf, prtf, pf, lf")
+    m.add_argument("--options", help="extra compile parameters")
+    _host_args(m)
+    m.set_defaults(fn=cmd_compile)
 
     c = sub.add_parser("check", help="validate flow files and list the flows")
     c.add_argument("paths", nargs="*", help="YAML files or folders (default $T5250_FLOWS)")

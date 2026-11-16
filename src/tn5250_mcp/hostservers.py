@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import base64
 import collections
+import fnmatch
 import json
 import os
 import posixpath
@@ -188,6 +189,26 @@ def helper_command(jar: str, java: str | None = None) -> list[str]:
     return base + ["-cp", jar, str(here.joinpath(HELPER))]
 
 
+LIBRARY = re.compile(r"^[A-Z$#@][A-Z0-9_$#@.]{0,9}$")
+
+
+def check_libl(libl) -> list[str]:
+    """A library list: up to 250 library names (uppercased)."""
+    if isinstance(libl, str):
+        libl = [x for x in re.split(r"[\s,]+", libl) if x]
+    out = [str(x).strip().upper() for x in libl]
+    if not out or len(out) > 250 or not all(LIBRARY.match(x) for x in out):
+        raise HostServerError("a library list is up to 250 library names, e.g. "
+                              "[\"MYLIB\", \"QGPL\"] (got %r)" % (libl,))
+    return out
+
+
+def command_name(cmd: str) -> str:
+    """CRTBNDRPG for 'QSYS/CRTBNDRPG PGM(...)'."""
+    first = cmd.strip().split(None, 1)[0].upper() if cmd.strip() else ""
+    return first.rsplit("/", 1)[-1].split("(", 1)[0]
+
+
 def norm_ifs_path(path: str) -> str:
     """Absolute, normalized IFS path; no '..' tricks."""
     if not path or not path.startswith("/"):
@@ -223,26 +244,36 @@ class HostServers:
     def __init__(self, jar: str | None = None, java: str | None = None, *,
                  allow_sql_write: bool = False, ifs_write_roots: list[str] | None = None,
                  guard=None, log=None, command: list[str] | None = None,
-                 max_rows: int = 1000, max_read: int = 1_000_000):
-        self.command = command or helper_command(jar, java)
-        self.helper = Helper(self.command)
+                 max_rows: int = 1000, max_read: int = 1_000_000,
+                 allow_commands: bool = False, command_allow: list[str] | None = None,
+                 compile_libs: list[str] | None = None):
+        self.java_command = command or helper_command(jar, java)
+        self.helper = Helper(self.java_command)
         self.allow_sql_write = allow_sql_write
         self.ifs_write_roots = [norm_ifs_path(r) for r in (ifs_write_roots or [])]
         self.guard = guard
         self.log = log or (lambda name, kind, text: None)
         self.max_rows, self.max_read = max_rows, max_read
         self.conns: dict[str, dict] = {}
+        # CL commands: off unless allowed; optionally only these command names
+        self.allow_commands = allow_commands
+        self.command_allow = [p.strip().upper() for p in (command_allow or []) if p.strip()]
+        # compile: only into these libraries ("*" = any)
+        self.compile_libs = [x.strip().upper() for x in (compile_libs or []) if x.strip()]
 
     # -- connections ----------------------------------------------------------
-    def connect(self, name: str, host: str, user: str, password: str, tls: bool = True) -> dict:
+    def connect(self, name: str, host: str, user: str, password: str, tls: bool = True,
+                libl: list[str] | None = None) -> dict:
         if self.guard:
             try:
                 self.guard.check_host(host)
             except PermissionError as e:
                 raise HostServerError(str(e)) from None
+        libl = check_libl(libl) if libl else None
         info = self.helper.call("connect", name=name, host=host, user=user.upper(),
-                                password=password, tls=tls)
+                                password=password, tls=tls, **({"libl": libl} if libl else {}))
         info["_host"] = host
+        info["libl"] = libl
         info["_gen"] = self.helper.generation
         self.conns[name] = info
         self.log(name, "host connect", "%s as %s (%s, %s)" % (
@@ -335,6 +366,147 @@ class HostServers:
         self.log(name, "sql execute", "%s\n-> %s" % (sql, res.get("update_count", "result set")))
         return res
 
+    # -- CL commands, compiles, job logs, spooled files ---------------------------
+    def _guard_command(self, command: str) -> str:
+        cmd = command.strip()
+        if not cmd:
+            raise HostServerError("empty command")
+        if self.guard:
+            try:
+                self.guard.check_values({"command": cmd})
+            except PermissionError as e:
+                raise HostServerError(str(e)) from None
+        return cmd
+
+    def command(self, name: str, command: str, libl: list[str] | None = None) -> dict:
+        """Run a CL command (in the connection's remote command job, with the
+        library list set first when given). Needs --allow-commands."""
+        self._need(name)
+        if not self.allow_commands:
+            raise HostServerError("running CL commands is off on this server (start it with "
+                                  "--allow-commands)")
+        cmd = self._guard_command(command)
+        verb = command_name(cmd)
+        if self.command_allow and not any(fnmatch.fnmatch(verb, p) for p in self.command_allow):
+            raise HostServerError("%s is not among the commands this server allows: %s"
+                                  % (verb, ", ".join(self.command_allow)))
+        return self._run_command(name, cmd, libl)
+
+    def _run_command(self, name: str, cmd: str, libl: list[str] | None) -> dict:
+        args = dict(name=name, command=cmd)
+        if libl:
+            args["libl"] = check_libl(libl)
+        res = self.helper.call("command", **args)
+        self.conns[name]["_cmdjob"] = res.get("job")
+        worst = max((m.get("severity", 0) for m in res.get("messages", [])), default=0)
+        self.log(name, "command", "%s%s\n-> %s (%d messages, worst severity %d)" % (
+            cmd, " [libl %s]" % " ".join(libl) if libl else "",
+            "ok" if res.get("ok") else "FAILED", len(res.get("messages", [])), worst))
+        return res
+
+    def compile(self, name: str, source: str, obj: str, kind: str | None = None,
+                options: str = "", libl: list[str] | None = None) -> dict:
+        """Compile a source (IFS path or LIB/FILE(MBR)) into LIB/NAME and read
+        the compiler's event file. Needs --allow-compile with that library."""
+        from .compiler import CompileError, build_command, parse_events, split_object
+        self._need(name)
+        try:
+            lib, objname = split_object(obj)
+            cmd = build_command(source, obj, kind, options)
+        except CompileError as e:
+            raise HostServerError(str(e)) from None
+        if not self.compile_libs:
+            raise HostServerError("compiling is off on this server (start it with "
+                                  "--allow-compile LIB[,LIB...])")
+        if "*" not in self.compile_libs and lib not in self.compile_libs:
+            raise HostServerError("this server compiles only into %s, not %s"
+                                  % (", ".join(self.compile_libs), lib))
+        cmd = self._guard_command(cmd)
+        started = self._server_time(name)
+        res = self._run_command(name, cmd, libl)
+        events, note = [], None
+        try:
+            recs = self.helper.call("read_member", name=name, lib=lib, file="EVFEVENT",
+                                    member=objname).get("records", [])
+            stamp = next((r.split()[2] for r in recs if r.startswith("TIMESTAMP")
+                          and len(r.split()) > 2), "")
+            if started and stamp and stamp < started:
+                note = "the event file is from an earlier compile; see the messages"
+            else:
+                events = parse_events(recs)
+                if not events and not res.get("ok"):
+                    errs = [r for r in recs if r.startswith("ERROR")][:5]
+                    note = ("the event file has %d records but no errors could be read from "
+                            "them%s" % (len(recs), (": " + " | ".join(errs)) if errs else ""))
+        except HostServerError:
+            note = "no event file was written; see the messages (and job_log)"
+        out = {"ok": bool(res.get("ok")), "object": "%s/%s" % (lib, objname), "command": cmd,
+               "messages": res.get("messages", []), "job": res.get("job"),
+               "diagnostics": [d.__dict__ for d in events], "note": note}
+        self.log(name, "compile", "%s -> %s, %d diagnostics" % (
+            cmd, "ok" if out["ok"] else "FAILED", len(events)))
+        return out
+
+    def _server_time(self, name: str) -> str:
+        """The IBM i's clock as YYYYMMDDHHMMSS (to tell old event files from new)."""
+        try:
+            res = self.helper.call("query", name=name, params=[], max_rows=1, sql=(
+                "SELECT VARCHAR_FORMAT(CURRENT TIMESTAMP, 'YYYYMMDDHH24MISS') "
+                "FROM SYSIBM.SYSDUMMY1"))
+            return str(res["rows"][0][0])
+        except (HostServerError, KeyError, IndexError):
+            return ""
+
+    def job_log(self, name: str, job: str | None = None, min_severity: int = 0,
+                last: int = 50) -> dict:
+        """Messages of a job's log (QSYS2.JOBLOG_INFO), newest last. job:
+        number/user/name, or None for the job that runs this connection's
+        commands and compiles."""
+        self._need(name)
+        job = (job or self.conns[name].get("_cmdjob") or "").strip()
+        if not job:
+            raise HostServerError("no command has run on this connection yet; give a job "
+                                  "(number/user/name)")
+        if not re.fullmatch(r"\d{6}/[A-Za-z0-9_$#@.]{1,10}/[A-Za-z0-9_$#@.]{1,10}", job):
+            raise HostServerError("job is number/user/name, e.g. 123456/QUSER/QZRCSRVS")
+        res = self.helper.call("query", name=name, params=[job, int(min_severity)],
+                               max_rows=max(1, min(last, 1000)), sql=(
+            "SELECT MESSAGE_TIMESTAMP, MESSAGE_ID, MESSAGE_TYPE, SEVERITY, "
+            "VARCHAR(MESSAGE_TEXT, 1000) AS MESSAGE_TEXT FROM TABLE(QSYS2.JOBLOG_INFO("
+            "CAST(? AS VARCHAR(28)))) X WHERE SEVERITY >= ? ORDER BY ORDINAL_POSITION DESC"))
+        res["rows"].reverse()
+        res["job"] = job
+        return res
+
+    def spooled_files(self, name: str, job: str | None = None, last: int = 20) -> dict:
+        """The user's newest spooled files (QSYS2.SPOOLED_FILE_INFO: fast, unlike
+        the output queue views on a busy system), optionally of one job. Output
+        of commands run through the host servers lands in the user's QPRTJOB job."""
+        self._need(name)
+        sql = ("SELECT SPOOLED_FILE_NAME, SPOOLED_FILE_NUMBER, QUALIFIED_JOB_NAME, STATUS, "
+               "TOTAL_PAGES, USER_DATA, CREATION_TIMESTAMP FROM TABLE(QSYS2.SPOOLED_FILE_INFO()) X")
+        params: list = []
+        if job:
+            sql += " WHERE QUALIFIED_JOB_NAME = ?"
+            params = [job.strip().upper()]
+        sql += " ORDER BY CREATION_TIMESTAMP DESC"
+        return self.helper.call("query", name=name, sql=sql, params=params,
+                                max_rows=max(1, min(last, 500)))
+
+    def spooled_file(self, name: str, job: str, file: str, number: str = "*LAST",
+                     max_lines: int = 2000) -> dict:
+        self._need(name)
+        res = self.helper.call("spooled_file", name=name, job=job.strip(), file=file.strip(),
+                               number=str(number), max_lines=max(1, min(max_lines, 20000)))
+        if not res.get("lines"):
+            raise HostServerError(
+                "no spooled file %s (number %s) in job %s. Note: output of commands run "
+                "through the host servers is in your QPRTJOB job; spooled_files lists your "
+                "newest spooled files with their jobs" % (file, number, job))
+        self.log(name, "spooled file", "%s %s %s (%d lines)" % (job, file, number,
+                                                                len(res.get("lines", []))))
+        return res
+
     # -- IFS --------------------------------------------------------------------
     def ifs_list(self, name: str, path: str, max_entries: int = 500) -> dict:
         self._need(name)
@@ -424,7 +596,7 @@ def host_password(mgr, name: str, user: str, host: str) -> tuple[str, str, bool]
 
 
 def host_login(mgr, hs: "HostServers", name: str, host: str, user: str,
-                tls: bool) -> tuple[dict, list[str]]:
+                tls: bool, libl: list[str] | None = None) -> tuple[dict, list[str]]:
     """Connect with a saved, typed or env password, guarding the profile:
     a rejected saved password is dropped and asked for once more; an expired
     password is never retried, the person chooses a new one in the viewer."""
@@ -432,7 +604,7 @@ def host_login(mgr, hs: "HostServers", name: str, host: str, user: str,
     pw, source, remember = host_password(mgr, name, user, host)
     for attempt in range(3):
         try:
-            info = hs.connect(name, host, user, pw, tls)
+            info = hs.connect(name, host, user, pw, tls, libl)
             break
         except HostServerError as e:
             if e.expired:

@@ -59,7 +59,8 @@ Workflow: connect -> get_screen -> fill / press -> read the screen that press re
 BUILTIN_TOOLS = {"connect", "disconnect", "list_sessions", "get_screen", "fill", "press",
                  "wait", "viewer", "keys", "record_start", "record_stop", "list_profiles",
                  "get_session_log", "host_connect", "host_disconnect", "sql_query",
-                 "sql_execute", "ifs_list", "ifs_read", "ifs_write", "forget_password"}
+                 "sql_execute", "ifs_list", "ifs_read", "ifs_write", "forget_password",
+                 "run_command", "compile", "job_log", "spooled_files", "spooled_file"}
 
 Session_ = Annotated[str, Field(description="session name; lets you run several side by side")]
 Conn_ = Annotated[str, Field(description="name of the host-server connection")]
@@ -407,6 +408,9 @@ def _add_host_tools(mcp: MCPServer, mgr: Manager, hs: HostServers, profiles: Pro
         = None,
         user: Annotated[str | None, Field(description="user profile")] = None,
         tls: Annotated[bool | None, Field(description="TLS (default true)")] = None,
+        libl: Annotated[list[str] | None, Field(
+            description="library list for SQL, commands and compiles (default: the "
+                        "profile's, else the user's own)")] = None,
         name: Conn_ = "main",
     ) -> str:
         """Open a connection to the IBM i database and file servers for the SQL
@@ -418,6 +422,7 @@ def _add_host_tools(mcp: MCPServer, mgr: Manager, hs: HostServers, profiles: Pro
                 raise ToolError("connect with either a profile or a host, not both")
             host, use_tls = p.host, p.tls
             user = user or p.user
+            libl = libl or p.libl
         else:
             if profiles_only:
                 raise ToolError("this server only connects through saved profiles: %s"
@@ -425,7 +430,7 @@ def _add_host_tools(mcp: MCPServer, mgr: Manager, hs: HostServers, profiles: Pro
             use_tls = True if tls is None else tls
         if not host or not user:
             raise ToolError("host_connect needs a host and a user (or a profile with a user)")
-        info, notes = await run(host_login, mgr, hs, name, host, user, use_tls)
+        info, notes = await run(host_login, mgr, hs, name, host, user, use_tls, libl)
         return "connected %s: %s on %s (%s, %s); jt400 %s%s" % (
             name, info["user"], info["host"], info["release"], "TLS" if use_tls else "plain",
             hs.helper.version, "".join("\nnote: " + n for n in notes))
@@ -467,6 +472,112 @@ def _add_host_tools(mcp: MCPServer, mgr: Manager, hs: HostServers, profiles: Pro
             block list."""
             res = await run(hs.execute, name, sql, params)
             return format_table(res)
+
+    def messages_text(msgs: list[dict]) -> str:
+        return "".join("\n  %s (severity %s) %s" % (m.get("id") or "-", m.get("severity"),
+                                                      m.get("text")) for m in msgs)
+
+    if hs.allow_commands and not read_only:
+        @mcp.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=True,
+                                              open_world_hint=True))
+        async def run_command(
+            command: Annotated[str, Field(description="a CL command, e.g. DSPOBJD OBJ(MYLIB/"
+                                                      "HELLO) OBJTYPE(*PGM)")],
+            libl: Annotated[list[str] | None, Field(
+                description="library list to set first (kept for later commands)")] = None,
+            name: Conn_ = "main",
+        ) -> str:
+            """Run a CL command through the host servers (not the screen) and return
+            IBM i's messages. Interactive commands that show screens don't work
+            here; use the 5250 session for those. job_log shows more detail."""
+            res = await run(hs.command, name, command, libl)
+            return "%s: %s%s%s\njob %s" % (
+                "ok" if res["ok"] else "FAILED", command,
+                " [libl %s]" % " ".join(res["libl"]) if res.get("libl") else "",
+                messages_text(res.get("messages", [])) or "\n  (no messages)", res.get("job"))
+
+    if hs.compile_libs and not read_only:
+        async def compile(
+            source: Annotated[str, Field(description="IFS stream file (/home/ME/src/hello."
+                                                     "rpgle) or member LIB/FILE(MEMBER)")],
+            object: Annotated[str, Field(description="the object to create: LIB/NAME")],
+            type: Annotated[str | None, Field(
+                description="rpg, sqlrpg, rpgmod, sqlrpgmod, cl, clmod, dspf, prtf, pf, lf; "
+                            "default from the file extension")] = None,
+            options: Annotated[str, Field(
+                description="extra compile parameters, e.g. TGTRLS(*CURRENT)")] = "",
+            libl: Annotated[list[str] | None, Field(description="library list to compile "
+                                                               "with")] = None,
+            format: Annotated[str, Field(description="text or json")] = "text",
+            name: Conn_ = "main",
+        ) -> str:
+            res = await run(hs.compile, name, source, object, type, options, libl)
+            if format == "json":
+                return json.dumps(res, ensure_ascii=False)
+            diags = res["diagnostics"]
+            errors = [d for d in diags if d["severity"] >= 20 and d["line"] > 0]
+            head = "%s %s: %s" % ("compiled" if res["ok"] else "compile FAILED for",
+                                  res["object"], res["command"])
+            lines = [head]
+            if diags:
+                lines.append("%d diagnostic%s (%d errors), most severe first:" % (
+                    len(diags), "" if len(diags) == 1 else "s", len(errors)))
+                lines += ["  %s:%d:%d %s %d %s %s" % (
+                    d["file"], d["line"], d["column"], d["severity_name"], d["severity"],
+                    d["id"], d["text"]) for d in diags[:100]]
+            if res.get("note"):
+                lines.append("note: " + res["note"])
+            msgs = [m for m in res["messages"] if (m.get("severity") or 0) >= 10]
+            if msgs:
+                lines.append("messages:" + messages_text(msgs))
+            lines.append("job %s (job_log for the full log)" % res.get("job"))
+            return "\n".join(lines)
+
+        mcp.add_tool(compile, description=(
+            "Compile a source into an object, only into these libraries: %s. Uses "
+            "OPTION(*EVENTF) and returns the compiler's errors as file:line:column, "
+            "severity, message ID and text, most severe first, so you can fix the source "
+            "(e.g. with ifs_write) and compile again." % ", ".join(hs.compile_libs)),
+            annotations=ToolAnnotations(read_only_hint=False, destructive_hint=True,
+                                        open_world_hint=True))
+
+    @mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True))
+    async def job_log(
+        job: Annotated[str | None, Field(
+            description="number/user/name; default: the job that ran this connection's "
+                        "commands and compiles")] = None,
+        min_severity: Annotated[int, Field(ge=0, le=99)] = 0,
+        last: Annotated[int, Field(ge=1, le=1000)] = 50,
+        name: Conn_ = "main",
+    ) -> str:
+        """A job's log (its messages), newest last: why a command, compile or
+        batch job failed."""
+        res = await run(hs.job_log, name, job, min_severity, last)
+        return "job log of %s:\n%s" % (res["job"], format_table(res, max_width=120))
+
+    @mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True))
+    async def spooled_files(
+        job: Annotated[str | None, Field(
+            description="number/user/name; default: your newest spooled files")] = None,
+        last: Annotated[int, Field(ge=1, le=500)] = 20,
+        name: Conn_ = "main",
+    ) -> str:
+        """List spooled files (printed output: reports, compile listings, job logs)."""
+        res = await run(hs.spooled_files, name, job, last)
+        return format_table(res)
+
+    @mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True))
+    async def spooled_file(
+        job: Annotated[str, Field(description="number/user/name of the job that made it")],
+        file: Annotated[str, Field(description="spooled file name, e.g. QSYSPRT")],
+        number: Annotated[str, Field(description="spooled file number, or *LAST")] = "*LAST",
+        max_lines: Annotated[int, Field(ge=1, le=20000)] = 2000,
+        name: Conn_ = "main",
+    ) -> str:
+        """Read a spooled file as text, e.g. to check a report a program printed."""
+        res = await run(hs.spooled_file, name, job, file, number, max_lines)
+        return "\n".join(res["lines"]) + ("\n(more lines not shown)" if res["truncated"]
+                                            else "")
 
     @mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True))
     async def ifs_list(
@@ -617,6 +728,13 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--allow-sql-write", action="store_true",
                    default=os.environ.get("T5250_ALLOW_SQL_WRITE") == "1",
                    help="offer sql_execute (statements that change data)")
+    p.add_argument("--allow-commands", action="store_true",
+                   default=os.environ.get("T5250_ALLOW_COMMANDS") == "1",
+                   help="offer run_command (CL commands through the host servers)")
+    p.add_argument("--command-allow", default=os.environ.get("T5250_COMMAND_ALLOW", ""),
+                   help="with --allow-commands: only these commands (e.g. 'DSP*,WRK*,CALL')")
+    p.add_argument("--allow-compile", default=os.environ.get("T5250_ALLOW_COMPILE", ""),
+                   help="offer compile, into these libraries (comma list, * = any)")
     p.add_argument("--ifs-write-root", action="append",
                    default=[x for x in os.environ.get("T5250_IFS_WRITE_ROOT", "").split(
                        os.pathsep) if x],
@@ -671,8 +789,12 @@ def main(argv: list[str] | None = None) -> None:
         profileset = ProfileSet.load(a.profiles) if a.profiles else None
         hostservers = None
         if a.jt400:
-            hostservers = HostServers(a.jt400, a.java, allow_sql_write=a.allow_sql_write,
-                                      ifs_write_roots=a.ifs_write_root, guard=guard)
+            hostservers = HostServers(
+                a.jt400, a.java, allow_sql_write=a.allow_sql_write,
+                ifs_write_roots=a.ifs_write_root, guard=guard,
+                allow_commands=a.allow_commands,
+                command_allow=[x for x in a.command_allow.split(",") if x.strip()],
+                compile_libs=[x for x in a.allow_compile.split(",") if x.strip()])
             print("tn5250-mcp: SQL/IFS tools on (%s)" % a.jt400, file=sys.stderr)
         server = build_server(mgr, flowset, toolsets, a.flows_only, a.read_only, a.pace,
                               profileset, a.profiles_only, hostservers)

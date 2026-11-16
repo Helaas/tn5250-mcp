@@ -87,6 +87,10 @@ claude mcp add --transport http tn5250 http://127.0.0.1:8250/mcp
 | `sql_execute` | change data (only with `--allow-sql-write`) |
 | `ifs_list`, `ifs_read` | list folders, read stream files (text in their CCSID, or base64) |
 | `ifs_write` | write stream files (only inside `--ifs-write-root` folders) |
+| `run_command` | run a CL command with a library list, get IBM i's messages (only with `--allow-commands`) |
+| `compile` | compile a source and get its errors as file:line:column (only into `--allow-compile` libraries) |
+| `job_log` | a job's messages: why a command, compile or batch job failed |
+| `spooled_files`, `spooled_file` | list and read printed output: reports, listings, job logs |
 | `list_sessions`, `keys` | housekeeping |
 | *your flows* | one tool per screen flow loaded with `--flows` |
 
@@ -150,6 +154,52 @@ it.
   /path/to/jt400.jar` (a test checks the jar matches the source). In Python:
   `HostServers("jt400.jar").connect(...)`, `.query(...)`, `.ifs_read(...)`.
 
+## Commands, compiling, job logs, spooled files
+
+With the jt400 helper an agent can also run CL commands and compile, through
+the host servers' remote command server (not the screen). That gives a coding
+agent the loop it needs: write the source, compile, read the errors, fix,
+compile again, run, check.
+
+```text
+ifs_write  /home/ME/src/hello.rpgle
+compile    {"source": "/home/ME/src/hello.rpgle", "object": "MYLIB/HELLO"}
+→ compile FAILED for MYLIB/HELLO: CRTBNDRPG PGM(MYLIB/HELLO) SRCSTMF(...) OPTION(*EVENTF) ...
+  /home/ME/src/hello.rpgle:3:9 severe 30 RNF7030 The name or indicator TOTL is not defined.
+run_command {"command": "CALL PGM(HELLO)"}          # found through the library list
+job_log    {}                                        # the full story if something failed
+```
+
+- **Library list.** `host_connect` takes `libl` (or a profile's `libl` key);
+  it applies to SQL, commands and compiles. `run_command` and `compile` can
+  set another one for a call.
+- **`run_command`** (with `--allow-commands`; `--command-allow "DSP*,WRK*,CALL"`
+  limits it to some commands) returns every message: ID, severity, text. All
+  commands go through the block list. Commands that show screens belong to the
+  5250 session.
+- **`compile`** (with `--allow-compile MYLIB[,LIB2]`, the libraries it may
+  create objects in; `*` = any) takes an IFS stream file or a member
+  `LIB/FILE(MBR)`, and picks the command from the type or file extension:
+  `rpg` (`.rpgle`), `sqlrpg` (`.sqlrpgle`), `rpgmod`, `sqlrpgmod`, `cl`
+  (`.clle`), `clmod`, `dspf`, `prtf`, `pf`, `lf`. It adds `OPTION(*EVENTF)`
+  and reads the compiler's event file, like Code for IBM i, for errors with
+  line and column. For stream files it compiles with `TGTCCSID(*JOB)` (RPG) or
+  `CVTCCSID(*JOB)` (SQL RPG), because RPG can't compile a UTF-8 file with its
+  default (RNS9380). `options` adds parameters; `format: json` returns it all
+  as data.
+- **`job_log`** shows a job's messages (by default the job that ran this
+  connection's commands and compiles). On PUB400 it pointed straight at the
+  UTF-8 problem above.
+- **`spooled_files`** lists your newest spooled files (`QSYS2.SPOOLED_FILE_INFO`,
+  which is fast where the output queue views hit query time limits);
+  **`spooled_file`** reads one. Output of commands run through the host
+  servers lands in your `QPRTJOB` job, not in the command's job.
+- From a shell or CI: `tn5250-run cmd "CRTBNDRPG ..." --libl MYLIB,QGPL` and
+  `tn5250-run compile src/hello.rpgle MYLIB/HELLO`, with `--profile` or
+  `--host/--user`. The password comes from the keychain, `$T5250_PASSWORD`, or
+  a prompt. They exit 0 on success and 1 on failure, and print errors as
+  `file:line:column: ...`, which editors and CI understand.
+
 ## Connection profiles
 
 Save the systems you use in a YAML file and start the server with
@@ -172,7 +222,7 @@ profiles:
 ```
 
 Keys: `host` (required), `description`, `port`, `tls`, `verify_tls`,
-`device_name`, `wide`, `codepage`, `user` (for `host_connect`), `after_connect` (a flow name, or `{flow,
+`device_name`, `wide`, `codepage`, `user` and `libl` (for `host_connect`), `after_connect` (a flow name, or `{flow,
 with}`), `on_reconnect`. Profiles never hold passwords; a file with a
 `password` key is refused. Use a sign-on flow as `after_connect`: it asks for
 the password in the viewer, or reads it from the environment.
@@ -537,6 +587,9 @@ listens on 127.0.0.1 and needs the random token, and it checks the Host header.
 | `--java PATH` | `T5250_JAVA` | found automatically (Java 11+) |
 | `--allow-sql-write` | `T5250_ALLOW_SQL_WRITE=1` | off |
 | `--ifs-write-root DIR` (repeatable) | `T5250_IFS_WRITE_ROOT` (`:`-separated) | no `ifs_write` |
+| `--allow-commands` | `T5250_ALLOW_COMMANDS=1` | no `run_command` |
+| `--command-allow "DSP*,CALL"` | `T5250_COMMAND_ALLOW` | any command (block list still applies) |
+| `--allow-compile LIB[,LIB]` | `T5250_ALLOW_COMPILE` | no `compile`; `*` = any library |
 
 ## Examples and tests
 
