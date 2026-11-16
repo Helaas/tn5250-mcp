@@ -115,17 +115,27 @@ def start_viewer(mgr: Manager, port: int) -> str:
                 n = int(self.headers.get("Content-Length", "0"))
                 req = json.loads(self.rfile.read(n) or b"{}")
                 s = mgr.get(req.get("session", ""))
-                if u.path == "/api/secret":
+                if u.path == "/api/record/start":
+                    mgr.record_start(s)
+                    self._json({"ok": True})
+                elif u.path == "/api/record/stop":
+                    name = str(req.get("name") or "").strip() or None
+                    text, path = mgr.record_stop(s, name, str(req.get("description") or ""),
+                                                 bool(req.get("save", True)),
+                                                 "none" if req.get("params") == "none" else "auto")
+                    tool = bool(text and mgr.on_recorded and mgr.on_recorded(text))
+                    self._json({"ok": True, "yaml": text, "path": path, "tool": tool,
+                                "record_dir": mgr.record_dir})
+                elif u.path == "/api/secret":
                     ok = mgr.answer_prompt(s.name, str(req.get("id", "")),
                                            None if req.get("cancel") else str(req.get("value", "")))
                     self._json({"ok": ok} if ok else {"ok": False,
                                                        "error": "that prompt is no longer open"},
                                200 if ok else 409)
                 elif u.path == "/api/reconnect":
-                    if s.connected:
+                    if s.connected or s.reconnecting:
                         return self._json({"ok": True})
-                    mgr.connect(s.name, s.host, s.port, s.tls, s.verify_tls, s.device_name,
-                                s.wide, s.cp.name, 20.0)
+                    mgr.reconnect_now(s)
                     self._json({"ok": True})
                 elif u.path == "/api/press":
                     mgr.press(s, req["key"], values=req.get("values") or {},

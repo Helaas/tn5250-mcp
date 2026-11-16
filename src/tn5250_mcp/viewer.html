@@ -49,6 +49,14 @@
                  border:1px solid var(--line); border-radius:6px; padding:6px 8px; }
   dialog .row2 { display:flex; gap:8px; justify-content:flex-end; margin-top:14px; }
   dialog .primary { background:var(--accent); color:#0b0d0c; border-color:var(--accent); }
+  dialog label { display:block; font-size:12px; color:var(--muted); margin:10px 0 4px; }
+  dialog select { width:100%; }
+  #recYaml { width:100%; height:300px; font:12px/1.4 ui-monospace, Menlo, Consolas, monospace;
+             color:var(--text); background:#000; border:1px solid var(--line); border-radius:6px;
+             padding:8px; white-space:pre; }
+  #rec { width:min(720px, calc(100vw - 32px)); }
+  #recBtn.on { background:var(--red); color:#0b0d0c; border-color:var(--red); font-weight:600; }
+  .reconnecting { color:#0b0d0c; background:var(--yellow); }
 </style>
 </head>
 <body>
@@ -58,6 +66,7 @@
   <span id="kb" class="pill">-</span>
   <span id="info" class="meta"></span>
   <button id="reconnect" hidden>Reconnect</button>
+  <button id="recBtn" hidden title="Record what you do here as a screen flow">&#9679; Record</button>
 </header>
 <main>
   <div id="empty">No session yet. Ask Claude to connect, then this page shows it live.</div>
@@ -81,6 +90,35 @@
     <div class="row2">
       <button type="button" id="pwCancel">Cancel</button>
       <button type="submit" class="primary">Send</button>
+    </div>
+  </form>
+</dialog>
+<dialog id="rec" aria-labelledby="recTitle">
+  <form id="recForm" method="dialog">
+    <h2 id="recTitle">Save the recording as a flow</h2>
+    <div id="recAsk">
+      <p>Every key you pressed became a step. Passwords were not recorded; the flow asks for
+        them in the viewer when it runs.</p>
+      <label for="recName">Flow name (lower_snake_case)</label>
+      <input id="recName" required pattern="[a-z][a-z0-9_]{0,63}" placeholder="add_order">
+      <label for="recDesc">What it does (the agent reads this)</label>
+      <input id="recDesc" placeholder="Add an order on the order entry screen.">
+      <label for="recParams">Typed values</label>
+      <select id="recParams">
+        <option value="auto">become parameters (recorded value = default)</option>
+        <option value="none">stay as typed</option>
+      </select>
+    </div>
+    <div id="recOut" hidden>
+      <p id="recWhere"></p>
+      <textarea id="recYaml" readonly spellcheck="false"></textarea>
+    </div>
+    <p id="recErr" style="color:var(--red)"></p>
+    <div class="row2">
+      <button type="button" id="recDiscard">Discard recording</button>
+      <button type="button" id="recBack">Keep recording</button>
+      <button type="button" id="recCopy" hidden>Copy</button>
+      <button type="submit" id="recSave" class="primary">Save</button>
     </div>
   </form>
 </dialog>
@@ -143,7 +181,7 @@ function render(s) {
       }
     });
   }
-  if (promptId) return;                       // the password dialog keeps the focus
+  if (promptId || $("rec").open) return;     // an open dialog keeps the focus
   if (focusEl) { focusEl[0].focus(); try { focusEl[0].setSelectionRange(focusEl[1], focusEl[1]); } catch (e) {} }
   else { const first = scr.querySelector("input"); if (first) first.focus(); }
 }
@@ -219,8 +257,13 @@ async function poll(force) {
   const s = st.screen;
   $("empty").hidden = !!s; $("scr").hidden = !s; $("keys").hidden = !s; $("help").hidden = !s;
   if (!s) { $("kb").textContent = "-"; $("kb").className = "pill"; return; }
-  $("kb").textContent = s.keyboard; $("kb").className = "pill " + s.keyboard;
-  $("reconnect").hidden = s.keyboard !== "disconnected";
+  $("kb").textContent = s.reconnecting ? "reconnecting (" + s.reconnecting + ")" : s.keyboard;
+  $("kb").className = "pill " + (s.reconnecting ? "reconnecting" : s.keyboard);
+  $("reconnect").hidden = s.keyboard !== "disconnected" || !!s.reconnecting;
+  const rb = $("recBtn");
+  rb.hidden = s.keyboard === "disconnected";
+  rb.classList.toggle("on", s.recording !== null && s.recording !== undefined);
+  rb.innerHTML = rb.classList.contains("on") ? `&#9632; Stop recording (${s.recording})` : "&#9679; Record";
   if (s.keyboard === "disconnected" && s.error) $("msg").textContent = "Disconnected: " + s.error;
   $("info").textContent = `${s.host} · screen ${s.screen_id} · cursor ${s.cursor.row},${s.cursor.col}` +
     (s.message_waiting ? " · message waiting" : "");
@@ -272,6 +315,41 @@ $("pwForm").addEventListener("submit", (e) => {
 });
 $("pwCancel").addEventListener("click", () => answerPrompt(true));
 $("pw").addEventListener("cancel", (e) => { e.preventDefault(); answerPrompt(true); });
+$("recBtn").addEventListener("click", async () => {
+  if (!current) return;
+  if (!$("recBtn").classList.contains("on")) {
+    const r = await api("/api/record/start", {session: current.session});
+    if (!r.ok) $("msg").textContent = r.error;
+    return poll(true);
+  }
+  $("recAsk").hidden = false; $("recOut").hidden = true; $("recErr").textContent = "";
+  $("recSave").hidden = false; $("recDiscard").hidden = false; $("recCopy").hidden = true;
+  $("recBack").textContent = "Keep recording";
+  $("rec").showModal(); $("recName").focus();
+});
+$("recForm").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const r = await api("/api/record/stop", {session: current.session, name: $("recName").value,
+    description: $("recDesc").value, params: $("recParams").value});
+  if (!r.ok) { $("recErr").textContent = r.error; return; }
+  $("recAsk").hidden = true; $("recOut").hidden = false; $("recErr").textContent = "";
+  $("recYaml").value = r.yaml;
+  $("recWhere").textContent = (r.path ? "Saved to " + r.path + ". "
+    : "Not saved: the server has no record folder (--record-dir); copy it into a flows file. ")
+    + (r.tool ? "Claude can use it as a tool now." : "");
+  $("recSave").hidden = true; $("recDiscard").hidden = true; $("recCopy").hidden = false;
+  $("recBack").textContent = "Close";
+  poll(true);
+});
+$("recDiscard").addEventListener("click", async () => {
+  await api("/api/record/stop", {session: current.session});
+  $("rec").close(); poll(true);
+});
+$("recBack").addEventListener("click", () => $("rec").close());
+$("recCopy").addEventListener("click", () => {
+  $("recYaml").select();
+  if (navigator.clipboard) navigator.clipboard.writeText($("recYaml").value);
+});
 $("sess").addEventListener("change", () => poll(true));
 $("reconnect").addEventListener("click", async () => {
   if (!current) return;

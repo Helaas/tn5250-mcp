@@ -24,6 +24,17 @@ def render(snap: dict, show_fields: bool = True) -> str:
         snap["session"], snap["host"], snap["screen_id"], snap["keyboard"].upper(),
         snap["cursor"]["row"], snap["cursor"]["col"],
         " | MESSAGE WAITING" if snap["message_waiting"] else ""))
+    if snap.get("reconnecting"):
+        out.append("the host dropped the connection; reconnecting (%s). Call wait; the host "
+                   "will show its sign-on screen." % snap["reconnecting"])
+    elif snap.get("last_reconnect"):
+        out.append("reconnected at %s after the host dropped the connection (%d so far); the "
+                   "session started over at sign-on" % (
+                       _dt.datetime.fromtimestamp(snap["last_reconnect"]).strftime("%H:%M:%S"),
+                       snap["reconnects"]))
+    if snap.get("recording") is not None:
+        out.append("RECORDING a flow: %d steps so far (record_stop to save it)"
+                   % snap["recording"])
     if snap["keyboard"] == "error":
         out.append("operator error: %r -- press Reset to continue" % snap["message_line"])
     elif snap["keyboard"] == "busy":
@@ -71,8 +82,15 @@ def render(snap: dict, show_fields: bool = True) -> str:
 
 class Manager:
     def __init__(self, guard: Guard, log_dir: str | None = None,
-                 default_codepage: str = "cp037"):
+                 default_codepage: str = "cp037", reconnect_attempts: int = 10,
+                 reconnect_interval: float = 5.0, record_dir: str | None = None):
         self.guard = guard
+        self.reconnect_attempts = reconnect_attempts
+        self.reconnect_interval = reconnect_interval
+        self.record_dir = record_dir
+        self.recorders: dict = {}                   # session -> Recorder
+        self.name_taken = lambda name: False        # set by the MCP server: tool names in use
+        self.on_recorded = None                     # set by the MCP server: register a flow
         self.log_dir = log_dir
         self.default_codepage = default_codepage
         self.sessions: dict[str, Session] = {}
@@ -169,14 +187,112 @@ class Manager:
             if old and old.connected:
                 raise GuardError("session %r is already connected to %s; disconnect it "
                                  "first or pick another session name" % (name, old.host))
+            if old:
+                old.close()                   # stops a pending auto-reconnect too
             s = Session(name, host, port, tls=tls, verify_tls=verify_tls,
                         device_name=device_name, wide=wide,
                         codepage=codepage or self.default_codepage, log=self._logger(name))
+            s.on_drop = self._dropped
             self.sessions[name] = s
         s.connect(timeout=timeout)
         s.log("connect", "%s:%d tls=%s" % (host, port, tls))
         s.wait(timeout=timeout)
         return s
+
+    # -- reconnect -------------------------------------------------------------
+    def _dropped(self, s: Session) -> None:
+        """The host closed the connection (line drop, idle timeout, ENDCNN).
+        Retry in the background, like a 5250 emulator (COMM659 -> COMM657)."""
+        s.log("dropped", s.last_error or "")
+        if self.reconnect_attempts <= 0:
+            return
+        with s.cond:                     # set before the thread runs, so wait() keeps waiting
+            if s.closing:
+                return
+            s.reconnecting = "attempt 1 of %d" % self.reconnect_attempts
+            s.cond.notify_all()
+        threading.Thread(target=self._reconnect_loop, args=(s,), daemon=True,
+                         name="5250-reconnect-" + s.name).start()
+
+    def _reconnect_loop(self, s: Session) -> None:
+        n = self.reconnect_attempts
+        for i in range(1, n + 1):
+            with s.cond:
+                if s.closing or self.sessions.get(s.name) is not s:
+                    s.reconnecting = None
+                    s.cond.notify_all()
+                    return
+                s.reconnecting = "attempt %d of %d" % (i, n)
+                s.cond.notify_all()
+            time.sleep(min(1.0, self.reconnect_interval) if i == 1 else self.reconnect_interval)
+            if s.closing or self.sessions.get(s.name) is not s:
+                break
+            try:
+                s.reconnect(timeout=20.0)
+            except OSError as e:
+                s.log("reconnect", "attempt %d of %d failed: %s" % (i, n, e))
+                continue
+            with s.cond:
+                s.reconnecting = None
+                s.reconnects += 1
+                s.last_reconnect = time.time()
+                s.cond.notify_all()
+            s.log("reconnect", "attempt %d of %d: connected" % (i, n))
+            return
+        with s.cond:
+            s.reconnecting = None
+            if not s.closing:
+                s.last_error = "%s (gave up reconnecting after %d attempts; use connect, or " \
+                               "Reconnect in the viewer)" % (s.last_error or "dropped", n)
+            s.cond.notify_all()
+
+    def reconnect_now(self, s: Session, timeout: float = 20.0) -> None:
+        """Reconnect a dropped session right away (the viewer's button)."""
+        if s.connected:
+            return
+        s.reconnect(timeout=timeout)
+        with s.cond:
+            s.reconnects += 1
+            s.last_reconnect = time.time()
+        s.log("reconnect", "manual: connected")
+        s.wait(timeout=timeout)
+
+    # -- recording flows --------------------------------------------------------
+    def record_start(self, s: Session) -> None:
+        from .recorder import Recorder
+        with self.lock:
+            if s.name in self.recorders:
+                raise GuardError("already recording session %s (%d steps); stop it first"
+                                 % (s.name, len(self.recorders[s.name].steps)))
+            self.recorders[s.name] = Recorder(s.name)
+        with s.cond:
+            s.recording_steps = 0
+        s.log("record", "started")
+
+    def record_stop(self, s: Session, name: str | None, description: str = "",
+                    save: bool = True, params: str = "auto") -> tuple[str | None, str | None]:
+        """Stop recording. With a name, return the flow as YAML (and the path
+        when saved to the record dir); without one, discard the recording."""
+        from .flows import FlowConfigError
+        rec = self.recorders.get(s.name)
+        if not rec:
+            raise GuardError("session %s is not being recorded" % s.name)
+        if name and self.name_taken(name):
+            raise GuardError("there is already a tool or flow called %r; pick another name" % name)
+        if name:
+            try:
+                text = rec.to_yaml(name, description, params)
+                path = rec.save(text, self.record_dir, name) if save and self.record_dir else None
+            except (FlowConfigError, OSError) as e:
+                raise GuardError(str(e)) from None
+        else:
+            text = path = None
+        with self.lock:
+            self.recorders.pop(s.name, None)
+        with s.cond:
+            s.recording_steps = None
+        s.log("record", "stopped" + (" -> %s" % (path or name) if name else " (discarded)"))
+        return text, path
 
     def disconnect(self, name: str) -> None:
         s = self.get(name)
@@ -216,6 +332,9 @@ class Manager:
                 s.fill(values, from_viewer=from_viewer)
             except (FieldError, ProtocolError) as e:
                 raise GuardError(str(e)) from None
+            rec = self.recorders.get(s.name)
+            if rec:
+                rec.on_fill(s, values)
         s.log("fill" + (" (viewer)" if from_viewer else ""),
               repr(self.masked(s, values, mask)))
 
@@ -229,9 +348,13 @@ class Manager:
                 self.guard.check_values(values)
             except PermissionError as e:
                 raise GuardError(str(e)) from None
+        rec = self.recorders.get(s.name)
+        step = None
         with s.cond:
             if not from_viewer and norm_key(key) != "reset":
                 self.check_screen(s, expect, screen_id)
+            if rec:
+                step = rec.before_press(s, key, values, cursor)
             try:
                 if values:
                     s.fill(values, from_viewer=from_viewer)
@@ -243,9 +366,12 @@ class Manager:
         s.log("press %s%s" % (key, " (viewer)" if from_viewer else ""),
               "values=%r cursor=%r" % (self.masked(s, values, mask), cursor))
         ok = True
-        if wait and norm_key(key) != "reset":
+        if (wait or step) and norm_key(key) != "reset":
             time.sleep(0.05)
             ok = s.wait(timeout=timeout, text=wait_for)
+        if step:
+            with s.cond:
+                rec.after_press(s, step)
         text = render(s.snapshot())
         for m in mask:
             if m:

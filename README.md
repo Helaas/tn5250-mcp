@@ -25,6 +25,8 @@ mandatory and hidden fields, and the exact keyboard state.
 | Mandatory / must-fill / check-digit fields | the host complains afterwards | refused before sending, like a real terminal |
 | Destructive commands | nothing stops them | configurable block list |
 | Repeatable procedures | prompt the agent again | YAML screen flows, run as tools or tests |
+| Writing those procedures | by hand | record them in the viewer or with the agent |
+| Host drops the session | start over by hand | reconnects by itself |
 
 ## Install
 
@@ -68,6 +70,7 @@ claude mcp add --transport http tn5250 http://127.0.0.1:8250/mcp
 | `press` | optional fills + cursor, then send a key and return the host's reply screen |
 | `wait` | wait until the host wants input (optionally for some text) |
 | `viewer` | link to the live viewer |
+| `record_start`, `record_stop` | record a session's key presses as a new flow |
 | `list_sessions`, `disconnect`, `keys` | housekeeping |
 | *your flows* | one tool per screen flow loaded with `--flows` |
 
@@ -150,6 +153,29 @@ MCP, a flow returns its step log, its captures and the final screen.
 See [`examples/flows/`](examples/flows/): `ibmi.yaml` (`signon`, `run_command`,
 a read-only `sql_select`) and `dfu_demo.yaml` (data entry through UPDDTA, plus
 `data_entry_test`, the end-to-end test).
+
+### Recording flows
+
+Instead of writing a flow, record it. Click **Record** in the viewer (or let
+the agent call `record_start`), go through the screens once, then stop and
+give the flow a name and a description. Each key press becomes a step:
+
+- `expect`: the title of the screen the key was pressed on;
+- `fill`: the fields typed, by label when the label is unique on that screen;
+- `check`: the title of the screen that came back (or `keyboard: error` when
+  the host answered with an operator error).
+
+Typed values become parameters, with what you typed as the default, so the
+flow replays as is or runs with other values (`params: none` keeps them
+literal). Passwords are never recorded: a hidden field becomes a `secret`
+parameter that is asked for in the viewer when the flow runs.
+
+The recording is checked to load as a valid flow, saved to `--record-dir` as
+`<name>.yaml`, and offered as a tool right away; recordings in that folder
+load again when the server starts. Review the expect/check texts once: a
+recording knows which screens you went through, not which parts of them
+matter. In Python: `t.record_start()` ... `t.record_stop("name", "what it
+does", save_dir="flows")`.
 
 ## Scripts, CI and pytest
 
@@ -247,12 +273,32 @@ agent can run `signon`, and you type the password in the viewer.
 - **Transcripts.** `--log-dir DIR` records every action and every screen the
   host sent, with hidden values masked. Useful as test evidence.
 
+## Reconnecting
+
+When the host drops a session (a line failure, an idle timeout, `SIGNOFF
+ENDCNN(*YES)`), the server reconnects by itself, like a 5250 emulator: up to
+`--reconnect-attempts` times (default 10), `--reconnect-interval` seconds
+apart (default 5). Meanwhile the screen header and the viewer say
+"reconnecting (attempt n of m)", `wait` waits for it, and keys are refused
+with a message telling the agent to wait. Afterwards the session starts over
+at the sign-on screen, and the header says when it reconnected. Sign on again,
+in the viewer or with a sign-on flow. If every attempt fails, the session
+stays disconnected (use `connect`, or **Reconnect** in the viewer).
+`disconnect` never triggers a reconnect. The Python `Terminal` and
+`tn5250-run` don't reconnect unless you ask (`reconnect_attempts=`), because
+scripts should fail fast.
+
+To get back the *same* job instead of a new one, connect with a fixed
+`device_name`: the host can then reconnect you to the disconnected job,
+depending on its `QDSCJOBITV` setting.
+
 ## The viewer
 
 A local page (`http://127.0.0.1:8251/?token=…`, link from the `viewer` tool)
 that shows the session live in colour with real input fields. It also shows
-the password dialog when a flow needs a secret, and reloads itself when the
-server has a newer version of the page. Type, press Enter
+the password dialog when a flow needs a secret, has the **Record** button for
+recording flows, shows reconnect progress, and reloads itself when the server
+has a newer version of the page. Type, press Enter
 or F-keys (Shift+F1-F12 = F13-F24), PageUp/PageDown, Esc = Reset. It only
 listens on 127.0.0.1 and needs the random token, and it checks the Host header.
 `--viewer-port 0` turns it off.
@@ -276,6 +322,9 @@ listens on 127.0.0.1 and needs the random token, and it checks the Host header.
 | `--flows-only` | `T5250_FLOWS_ONLY=1` | off |
 | `--read-only` | `T5250_READ_ONLY=1` | off |
 | `--pace SECONDS` | `T5250_PACE` | `0` (no wait between flow steps) |
+| `--reconnect-attempts N` | `T5250_RECONNECT_ATTEMPTS` | `10`, `0` = off |
+| `--reconnect-interval SECONDS` | `T5250_RECONNECT_INTERVAL` | `5` |
+| `--record-dir DIR` | `T5250_RECORD_DIR` | recordings are returned, not saved |
 
 ## Examples and tests
 

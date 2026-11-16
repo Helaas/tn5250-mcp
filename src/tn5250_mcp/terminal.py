@@ -34,14 +34,16 @@ class Terminal:
                  session: str = "main", device_name: str | None = None, wide: bool = False,
                  codepage: str = "cp037", log_dir: str | None = None,
                  guard: Guard | None = None, viewer_port: int | None = None,
-                 timeout: float = 20.0, pace: float = 0.0):
+                 timeout: float = 20.0, pace: float = 0.0, reconnect_attempts: int = 0,
+                 reconnect_interval: float = 5.0):
         self.host, self.port, self.tls, self.verify_tls = host, port, tls, verify_tls
         self.name, self.device_name, self.wide = session, device_name, wide
         self.timeout = timeout
         # Scripts are written by people, so screen checks are optional here;
         # the block list still applies.
         self.mgr = Manager(guard or Guard(require_check=False), log_dir=log_dir,
-                           default_codepage=codepage)
+                           default_codepage=codepage, reconnect_attempts=reconnect_attempts,
+                           reconnect_interval=reconnect_interval)
         if flows is None or isinstance(flows, FlowSet):
             self.flows = flows
         else:
@@ -163,6 +165,26 @@ class Terminal:
         if not self.flows:
             raise TerminalError("no flows loaded (pass flows=[...] to Terminal)")
         return self.runner.run(self.session, flow, params)
+
+    # -- recording -------------------------------------------------------------
+    def record_start(self) -> None:
+        """Record every key pressed from now on (here or in the viewer)."""
+        try:
+            self.mgr.record_start(self.session)
+        except GuardError as e:
+            raise TerminalError(str(e)) from None
+
+    def record_stop(self, name: str | None = None, description: str = "",
+                    save_dir: str | None = None, params: str = "auto") -> str | None:
+        """Stop recording; return the flow as YAML (also written to
+        save_dir/<name>.yaml when given). No name discards the recording."""
+        self.mgr.record_dir = save_dir
+        try:
+            text, _ = self.mgr.record_stop(self.session, name, description, bool(save_dir),
+                                           params)
+        except GuardError as e:
+            raise TerminalError(str(e)) from None
+        return text
 
     # -- sign on / off -------------------------------------------------------
     def signon(self, user: str | None = None, password: str | None = None, *,

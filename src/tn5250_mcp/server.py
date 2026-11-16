@@ -9,7 +9,7 @@ import sys
 from typing import Annotated, Any
 
 import anyio
-from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp_types import ToolAnnotations
 from pydantic import Field
@@ -39,12 +39,16 @@ Workflow: connect -> get_screen -> fill / press -> read the screen that press re
   checks every screen on the way and validates its parameters. A flow that
   needs a password (e.g. a sign-on flow) asks the user for it in the viewer;
   give them the viewer link first.
+- If the host drops the connection, the server reconnects by itself; the
+  session then starts over at the sign-on screen. Call wait, then sign on again.
+- record_start / record_stop turn what you (and the user in the viewer) do on a
+  session into a reusable screen flow (YAML).
 - press refuses keys a real terminal would refuse (mandatory entry, mandatory
   fill, wrong check digit) and says which field to fix; nothing is sent then.
 """
 
 BUILTIN_TOOLS = {"connect", "disconnect", "list_sessions", "get_screen", "fill", "press",
-                 "wait", "viewer", "keys"}
+                 "wait", "viewer", "keys", "record_start", "record_stop"}
 
 Session_ = Annotated[str, Field(description="session name; lets you run several side by side")]
 
@@ -100,8 +104,10 @@ def _flow_description(f: Flow, flows: FlowSet) -> str:
 def build_server(mgr: Manager, flows: FlowSet | None = None,
                  toolsets: list[str] | None = None, flows_only: bool = False,
                  read_only: bool = False, pace: float = 0.0) -> MCPServer:
-    mcp = MCPServer("tn5250", instructions=INSTRUCTIONS, version="0.3.0")
-    runner = FlowRunner(mgr, flows, pace=pace) if flows else None
+    mcp = MCPServer("tn5250", instructions=INSTRUCTIONS, version="0.4.0")
+    flows = flows if flows is not None else FlowSet()
+    runner = FlowRunner(mgr, flows, pace=pace)
+    mgr.name_taken = lambda n: n in BUILTIN_TOOLS or n in flows.flows
 
     async def run(fn, *a, **k):
         try:
@@ -229,15 +235,82 @@ def build_server(mgr: Manager, flows: FlowSet | None = None,
         over. Give it to the user when a password is needed."""
         return mgr.viewer_url or "the viewer is disabled (--viewer-port 0)"
 
+    @mcp.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False))
+    async def record_start(session: Session_ = "main") -> str:
+        """Start recording a screen flow on this session: every key pressed from
+        now on (by you or by the user in the viewer) becomes a step. Passwords
+        are never recorded. Finish with record_stop."""
+        s = await run(mgr.get, session)
+        await run(mgr.record_start, s)
+        return "recording %s; press keys as usual, then call record_stop" % session
+
+    @mcp.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False))
+    async def record_stop(
+        name: Annotated[str | None, Field(
+            description="flow name (lower_snake_case); leave out to discard the recording")] = None,
+        description: Annotated[str, Field(
+            description="what the flow does; the agent reads it when choosing tools")] = "",
+        save: Annotated[bool, Field(
+            description="write <name>.yaml to the server's record folder")] = True,
+        params: Annotated[str, Field(
+            description="auto: typed values become parameters (recorded value = default); "
+                        "none: keep them literal")] = "auto",
+        session: Session_ = "main",
+        ctx: Context | None = None,
+    ) -> str:
+        """Stop recording and return the flow as YAML (saved when the server has a
+        record folder). The flow is available as a tool right away. Review it
+        before relying on it."""
+        s = await run(mgr.get, session)
+        if name and (name in BUILTIN_TOOLS or name in flows.flows):
+            raise ToolError("there is already a tool or flow called %r; pick another name"
+                            % name)
+        text, path = await run(mgr.record_stop, s, name, description, save,
+                               "none" if params == "none" else "auto")
+        if text is None:
+            return "recording discarded"
+        where = ("saved to %s" % path) if path else (
+            "not saved (start the server with --record-dir to save recordings)")
+        added = _register_recorded(mcp, flows, runner, run, text, toolsets, flows_only,
+                                   read_only)
+        if added and ctx is not None:
+            for notify in (lambda: ctx.notify_tools_changed(),
+                           lambda: ctx.request_context.session.send_tool_list_changed()):
+                try:
+                    await notify()
+                except Exception:  # noqa: BLE001 - clients without list_changed support
+                    pass
+        return "%s; %s\n\n%s" % (where, "available now as the tool %s" % name if added
+                                  else "not offered as a tool on this server", text)
+
     @mcp.tool(annotations=ToolAnnotations(read_only_hint=True))
     async def keys() -> str:
         """List the key names press accepts."""
         return ", ".join(ALL_KEYS)
 
-    if flows:
-        for f in flows.select(toolsets, read_only, allow_secrets=bool(mgr.viewer_url)):
-            _add_flow_tool(mcp, f, flows, runner, run)
+    for f in flows.select(toolsets, read_only, allow_secrets=bool(mgr.viewer_url)):
+        _add_flow_tool(mcp, f, flows, runner, run)
+    # recordings saved from the viewer become tools too (clients see them on their
+    # next tool listing)
+    mgr.on_recorded = lambda text: _register_recorded(mcp, flows, runner, run, text, toolsets,
+                                                      flows_only, read_only)
     return mcp
+
+
+def _register_recorded(mcp, flows: FlowSet, runner: FlowRunner, run, text: str,
+                       toolsets, flows_only: bool, read_only: bool) -> bool:
+    """Add a just-recorded flow to the running server."""
+    import yaml
+    doc = yaml.safe_load(text)
+    flows.add_doc(doc, "recording")
+    flows.validate()
+    added = False
+    for name in doc["flows"]:
+        f = flows.flows[name]
+        if f in flows.select(toolsets, read_only, allow_secrets=bool(runner.mgr.viewer_url)):
+            _add_flow_tool(mcp, f, flows, runner, run)
+            added = True
+    return added
 
 
 def _add_flow_tool(mcp: MCPServer, f: Flow, flows: FlowSet, runner: FlowRunner,
@@ -292,6 +365,14 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--log-dir", default=os.environ.get("T5250_LOG_DIR"),
                    help="write a transcript of every session here")
     p.add_argument("--codepage", default=os.environ.get("T5250_CODEPAGE", "cp037"))
+    p.add_argument("--reconnect-attempts", type=int,
+                   default=int(os.environ.get("T5250_RECONNECT_ATTEMPTS", "10")),
+                   help="reconnect this many times when the host drops a session (0 = off)")
+    p.add_argument("--reconnect-interval", type=float,
+                   default=float(os.environ.get("T5250_RECONNECT_INTERVAL", "5")),
+                   help="seconds between reconnect attempts")
+    p.add_argument("--record-dir", default=os.environ.get("T5250_RECORD_DIR"),
+                   help="folder where record_stop saves recorded flows")
     p.add_argument("--flows", action="append",
                    default=[x for x in os.environ.get("T5250_FLOWS", "").split(os.pathsep) if x],
                    help="YAML file or folder of screen flows to offer as tools (repeatable)")
@@ -306,6 +387,10 @@ def main(argv: list[str] | None = None) -> None:
                    default=os.environ.get("T5250_READ_ONLY") == "1",
                    help="no fill/press, and only flows marked read_only")
     a = p.parse_args(argv)
+    if a.record_dir and os.path.isdir(a.record_dir) and any(
+            n.endswith((".yaml", ".yml")) for n in os.listdir(a.record_dir)) and \
+            os.path.abspath(a.record_dir) not in {os.path.abspath(x) for x in a.flows}:
+        a.flows.append(a.record_dir)          # recorded flows come back after a restart
     try:
         flowset = FlowSet.load(a.flows) if a.flows else None
     except FlowConfigError as e:
@@ -315,7 +400,9 @@ def main(argv: list[str] | None = None) -> None:
     guard = Guard(require_check=not a.no_require_check,
                   allowed_hosts=[h.strip() for h in a.allowed_hosts.split(",") if h.strip()],
                   blocked=blocked)
-    mgr = Manager(guard, log_dir=a.log_dir, default_codepage=a.codepage)
+    mgr = Manager(guard, log_dir=a.log_dir, default_codepage=a.codepage,
+                  reconnect_attempts=a.reconnect_attempts,
+                  reconnect_interval=a.reconnect_interval, record_dir=a.record_dir)
 
     if a.viewer_port:
         from .viewer import start_viewer

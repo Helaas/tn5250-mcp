@@ -122,6 +122,12 @@ class Session:
         self.saved: dict[int, SavedScreen] = {}
         self._save_ids = itertools.count(1)
         self._reader: threading.Thread | None = None
+        self.closing = False              # close() was asked for: no auto-reconnect
+        self.on_drop = None               # called (from the reader) when the host drops us
+        self.reconnecting: str | None = None   # e.g. "attempt 2 of 10", while it runs
+        self.reconnects = 0
+        self.last_reconnect: float | None = None   # wall clock of the last good reconnect
+        self.recording_steps: int | None = None    # steps so far while a recorder runs
 
     # ------------------------------------------------------------------ io
     def connect(self, timeout: float = 20.0) -> None:
@@ -136,8 +142,30 @@ class Session:
                                         daemon=True)
         self._reader.start()
 
+    def reconnect(self, timeout: float = 20.0) -> None:
+        """Open a new connection for this session after the old one dropped.
+        The screen starts empty again; the host sends its sign-on screen."""
+        with self.cond:
+            if self.conn:
+                try:
+                    self.conn.close()
+                except OSError:
+                    pass
+            rows, cols = self.buf.rows, self.buf.cols
+            self.buf = ScreenBuffer(rows, cols)
+            self.read_opcode, self.keyboard, self.inhibited = 0, "locked", False
+            self.error_line, self.pending_ic, self.message_waiting = None, None, False
+            self.saved.clear()
+            self.host_seq += 1
+            self.closing = False
+        self.connect(timeout=timeout)
+        with self.cond:
+            self.last_error = None
+            self.cond.notify_all()
+
     def close(self) -> None:
         with self.cond:
+            self.closing = True
             self.connected = False
             if self.conn:
                 self.conn.close()
@@ -154,10 +182,13 @@ class Session:
                     self.cond.notify_all()
         except Exception as e:  # noqa: BLE001 - reader must report anything
             with self.cond:
+                dropped = self.connected and not self.closing
                 if self.connected:
                     self.last_error = "%s: %s" % (type(e).__name__, e)
                 self.connected = False
                 self.cond.notify_all()
+            if dropped and self.on_drop:
+                self.on_drop(self)
 
     def _send(self, data: bytes, opcode: int, flags: int = T.H_NONE) -> None:
         if not self.connected or not self.conn:
@@ -533,6 +564,10 @@ class Session:
     # ------------------------------------------------------- public API
     def _check_open(self) -> None:
         if not self.connected:
+            if self.reconnecting:
+                raise ProtocolError("session %r lost its connection and is reconnecting (%s); "
+                                    "call wait, then sign on again" % (self.name,
+                                                                       self.reconnecting))
             raise ProtocolError("session %r is not connected%s" % (
                 self.name, ": " + self.last_error if self.last_error else ""))
 
@@ -558,10 +593,11 @@ class Session:
         deadline = time.monotonic() + timeout
         with self.cond:
             while True:
-                if not self.connected:
+                if not self.connected and not self.reconnecting:
                     return True
                 now = time.monotonic()
-                if self.ready() and (text is None or text in "\n".join(self.rows())):
+                if self.connected and self.ready() and (
+                        text is None or text in "\n".join(self.rows())):
                     quiet = now - self.last_host_time
                     if quiet >= settle:
                         return True
@@ -810,6 +846,10 @@ class Session:
                 "message_line": rows[b.msg_line()].strip(),
                 "fields": fields,
                 "error": self.last_error,
+                "reconnecting": self.reconnecting,
+                "reconnects": self.reconnects,
+                "last_reconnect": self.last_reconnect,
+                "recording": self.recording_steps,
             }
 
     def cell_attrs(self) -> list[int]:
