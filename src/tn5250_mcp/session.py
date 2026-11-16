@@ -734,7 +734,8 @@ class Session:
                 self.cond.notify_all()
                 return
             if k == "sysreq":
-                self.keyboard = "locked"
+                # the host may or may not answer (e.g. not at sign-on), so the
+                # keyboard is not locked, as in tn5250
                 self._send(b"", T.OP_NO_OP, T.H_SRQ)
                 return
             if k == "attn":
@@ -789,6 +790,35 @@ class Session:
                 name = next((n for n, v in AID.items() if v == aid), "the key")
                 raise FieldError(problem % (r, c, name.capitalize() if len(name) > 3
                                             else name.upper()))
+
+    def on_signon_screen(self) -> bool:
+        """A sign-on screen: a hidden (password) field next to a visible one,
+        and 'password' or 'sign on' on screen (custom screens included)."""
+        with self.cond:
+            fields = self.buf.input_fields()
+            text = "\n".join(self.rows()).lower()
+            return (any(g[0].hidden for g in fields) and any(not g[0].hidden for g in fields)
+                    and ("password" in text or "sign on" in text))
+
+    def command_line(self) -> str | None:
+        """The CL command line of this screen ("row,col"): an input field right
+        after "===>" whose label mentions "command" (menus: "Selection or
+        command", list panels: "Parameters or command", Command Entry). The
+        STRSQL statement line and other "===>" prompts don't count."""
+        with self.cond:
+            rows = self.rows()
+            for g in self.buf.input_fields():
+                f0 = g[0]
+                if f0.hidden:
+                    continue
+                r, c = self.buf.rowcol(f0.start)
+                if not rows[r - 1][:c - 1].rstrip().endswith("===>"):
+                    continue
+                label = self.buf.label_for(f0, rows).lower()
+                above = rows[r - 2].lower() if r >= 2 else ""
+                if "command" in label or "command" in above:
+                    return "%d,%d" % (r, c)
+            return None
 
     def _row_segments(self, group: list[Field]) -> list[dict]:
         """Split a logical field into on-screen pieces, one per row (a long

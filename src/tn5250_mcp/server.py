@@ -51,7 +51,8 @@ Workflow: connect -> get_screen -> fill / press -> read the screen that press re
 """
 
 BUILTIN_TOOLS = {"connect", "disconnect", "list_sessions", "get_screen", "fill", "press",
-                 "wait", "viewer", "keys", "record_start", "record_stop", "list_profiles"}
+                 "wait", "viewer", "keys", "record_start", "record_stop", "list_profiles",
+                 "get_session_log"}
 
 Session_ = Annotated[str, Field(description="session name; lets you run several side by side")]
 
@@ -141,7 +142,8 @@ def build_server(mgr: Manager, flows: FlowSet | None = None,
         session: Session_ = "main",
         verify_tls: bool | None = None,
         device_name: Annotated[str | None, Field(
-            description="ask for a specific display device name")] = None,
+            description="ask for a display device name; * becomes A, B, C... per connection "
+                        "(e.g. AGENT*), = a random character")] = None,
         wide: Annotated[bool | None, Field(
             description="27x132 display (3477) instead of 24x80")] = None,
         codepage: Annotated[str | None, Field(
@@ -175,6 +177,18 @@ def build_server(mgr: Manager, flows: FlowSet | None = None,
         return head + render(s.snapshot()) + viewer_hint()
 
     @mcp.tool(annotations=ToolAnnotations(read_only_hint=True))
+    async def get_session_log(
+        session: Session_ = "main",
+        last: Annotated[int, Field(description="how many entries", ge=1, le=400)] = 20,
+        screens: Annotated[bool, Field(
+            description="also include the screens the host sent (long)")] = False,
+    ) -> str:
+        """The session's transcript: connects, fills (passwords masked), keys,
+        flows, reconnects and recordings, newest last. Useful to retrace what
+        happened, also after a disconnect."""
+        return await run(mgr.session_log, session, last, screens)
+
+    @mcp.tool(annotations=ToolAnnotations(read_only_hint=True))
     async def list_profiles() -> str:
         """List the saved connection profiles you can connect with."""
         if not profiles.profiles:
@@ -184,11 +198,17 @@ def build_server(mgr: Manager, flows: FlowSet | None = None,
 
     @mcp.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False,
                                           idempotent_hint=True))
-    async def disconnect(session: Session_ = "main") -> str:
-        """Close a session (does not sign off; use the host's sign-off first if you
-        want a clean end, e.g. SIGNOFF on a command line)."""
-        await run(mgr.disconnect, session)
-        return "disconnected %s" % session
+    async def disconnect(
+        session: Session_ = "main",
+        signoff: Annotated[bool, Field(
+            description="sign off first from the screen's command line, so the job "
+                        "doesn't stay active on the host")] = True,
+    ) -> str:
+        """Sign off (from the command line of the current screen) and close the
+        session. A screen without a command line can't be signed off from; the
+        result says so."""
+        note = await run(mgr.disconnect, session, signoff)
+        return "disconnected %s%s" % (session, "; " + note if note else "")
 
     @mcp.tool(annotations=ToolAnnotations(read_only_hint=True))
     async def list_sessions() -> str:

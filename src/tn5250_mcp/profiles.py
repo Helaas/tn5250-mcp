@@ -59,23 +59,12 @@ class Profile:
     _seq: Any = field(default=None, repr=False)
 
     def next_device_name(self) -> str | None:
-        """Expand the device name pattern: each * becomes the next letter
-        (A, B, ... Z, then A again) for this profile, each = a random
-        letter or digit."""
+        """Expand the device name pattern (see expand_device_name)."""
         if not self.device_name:
             return None
         if self._seq is None:
             self._seq = itertools.cycle(_LETTERS)
-        out = []
-        letter = next(self._seq) if "*" in self.device_name else ""
-        for ch in self.device_name:
-            if ch == "*":
-                out.append(letter)
-            elif ch == "=":
-                out.append(random.choice(_LETTERS + string.digits))
-            else:
-                out.append(ch)
-        return "".join(out)
+        return expand_device_name(self.device_name, self._seq)
 
     def summary(self) -> str:
         parts = ["%s:%d" % (self.host, self.port), "TLS" if self.tls else "plain telnet"]
@@ -88,6 +77,24 @@ class Profile:
                          + (" (again after a reconnect)" if self.on_reconnect else ""))
         return "%s: %s%s" % (self.name, ", ".join(parts),
                              " - " + self.description if self.description else "")
+
+
+def check_device_name(pattern: str) -> str:
+    """Upper-case and validate a device name or pattern; ValueError if bad."""
+    p = pattern.strip().upper()
+    if not _DEVNAME.match(p.replace("*", "A").replace("=", "A")):
+        raise ValueError("device name %r: up to 10 letters, digits, #, $, @ or _, starting "
+                         "with a letter (* = A, B, C... per connection; = = random)" % pattern)
+    return p
+
+
+def expand_device_name(pattern: str, seq) -> str:
+    """Each * becomes the next letter from `seq` (A, B, ... Z, A again), each
+    = a random letter or digit. Several sessions can then share a pattern."""
+    letter = next(seq) if "*" in pattern else ""
+    return "".join(letter if ch == "*" else
+                   random.choice(_LETTERS + string.digits) if ch == "=" else ch
+                   for ch in pattern)
 
 
 def _bool(spec: dict, key: str, default: bool, where: str) -> bool:
@@ -124,12 +131,10 @@ def parse_profile(name: str, spec: Any, source: str) -> Profile:
                 wide=_bool(spec, "wide", False, where),
                 on_reconnect=_bool(spec, "on_reconnect", False, where), source=source)
     if spec.get("device_name") is not None:
-        p.device_name = str(spec["device_name"]).upper()
-        sample = p.device_name.replace("*", "A").replace("=", "A")
-        if not _DEVNAME.match(sample):
-            raise ProfileError("%s: device_name %r: up to 10 letters, digits, #, $, @ or _, "
-                               "starting with a letter (* = A, B, C...; = = random)"
-                               % (where, spec["device_name"]))
+        try:
+            p.device_name = check_device_name(str(spec["device_name"]))
+        except ValueError as e:
+            raise ProfileError("%s: %s" % (where, e)) from None
     if spec.get("codepage") is not None:
         try:
             codecs.lookup(str(spec["codepage"]))

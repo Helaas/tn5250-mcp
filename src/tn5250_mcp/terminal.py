@@ -165,10 +165,7 @@ class Terminal:
         """A sign-on screen: a hidden (password) input field next to a visible
         one, and the word 'password' or 'sign on' on screen. Works for custom
         sign-on screens too (PUB400's has no 'Sign On' title)."""
-        fields = self.session.buf.input_fields()
-        text = self.text.lower()
-        return (any(g[0].hidden for g in fields) and any(not g[0].hidden for g in fields)
-                and ("password" in text or "sign on" in text))
+        return self.session.on_signon_screen()
 
     def field(self, ref: str) -> str:
         """Current text of an input field (not for hidden fields)."""
@@ -288,25 +285,15 @@ class Terminal:
             self.press("Enter", expect=screen, timeout=timeout)
         raise TerminalError("still not past the sign-on messages\n%s" % self.screen())
 
-    def signoff(self) -> None:
-        """Type SIGNOFF on the command line of the current screen and close."""
-        s = self.session
-        target = None
-        for ref in ("Selection or command", "command", "===>"):
-            try:
-                target = s.resolve(ref)
-                break
-            except FieldError:
-                continue
-        if target is None:
-            raise TerminalError("no command line on this screen to sign off from\n%s"
-                                % self.screen())
-        ref = "%d,%d" % s.buf.rowcol(target[0].start)
+    def signoff(self) -> str:
+        """Sign off from the current screen's command line, then close.
+        Returns what happened ("signed off", or why not)."""
         try:
-            self.mgr.press(s, "Enter", {ref: "SIGNOFF"}, None, None, None, True, None, 10.0)
-        except (GuardError, OSError):
-            pass
+            note = self.mgr.signoff(self.session)
+        except OSError as e:
+            note = "not signed off: %s" % e
         self.close()
+        return note
 
 
 __all__ = ["Terminal", "TerminalError", "FlowError", "FlowResult", "FlowSet"]

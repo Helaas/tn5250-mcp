@@ -64,7 +64,7 @@ claude mcp add --transport http tn5250 http://127.0.0.1:8250/mcp
 
 | tool | what it does |
 |---|---|
-| `connect` | open a session with a saved `profile`, or `host`, `port` 992/23, `tls`, `device_name`, `wide` for 27x132, `codepage` |
+| `connect` | open a session with a saved `profile`, or `host`, `port` 992/23, `tls`, `device_name` (`AGENT*` = AGENTA, AGENTB, ...), `wide` for 27x132, `codepage` |
 | `list_profiles` | the saved connection profiles |
 | `get_screen` | screen text with rulers, cursor, keyboard state, `screen_id`, input-field table |
 | `fill` | put values into fields (by `"row,col"`, `"#index"` or label) without sending |
@@ -72,7 +72,9 @@ claude mcp add --transport http tn5250 http://127.0.0.1:8250/mcp
 | `wait` | wait until the host wants input (optionally for some text) |
 | `viewer` | link to the live viewer |
 | `record_start`, `record_stop` | record a session's key presses as a new flow |
-| `list_sessions`, `disconnect`, `keys` | housekeeping |
+| `disconnect` | sign off from the screen's command line, then close (`signoff: false` to skip) |
+| `get_session_log` | the session's transcript (passwords masked), also after a disconnect |
+| `list_sessions`, `keys` | housekeeping |
 | *your flows* | one tool per screen flow loaded with `--flows` |
 
 Several sessions can run side by side (`session` argument).
@@ -314,8 +316,16 @@ agent can run `signon`, and you type the password in the viewer.
 - **Per-tool permissions.** Read tools are marked read-only and `press` is
   marked destructive, so MCP clients can auto-approve reading and still ask
   before keys are sent.
-- **Transcripts.** `--log-dir DIR` records every action and every screen the
-  host sent, with hidden values masked. Useful as test evidence.
+- **Transcripts.** Every action and every screen the host sent is recorded,
+  with hidden fields and secrets masked (decided before the key is sent, so a
+  fast host can't expose a password). The agent reads it with
+  `get_session_log` (last 400 entries in memory); `--log-dir DIR` also writes
+  it to files, useful as test evidence.
+- **Clean sign-off.** `disconnect` first types `SIGNOFF` on the screen's CL
+  command line (a `===>` field labelled with "command", as on menus, list
+  panels and Command Entry; not the STRSQL statement line), so no job is
+  left behind on the host. On a screen without one it types nothing and says
+  so. `Terminal.signoff()` and `tn5250-run --signoff` do the same.
 
 ## Reconnecting
 

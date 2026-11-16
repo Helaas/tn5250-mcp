@@ -55,7 +55,7 @@ profiles:
     ("profiles: {p: {host: h, colour: red}}", "unknown keys"),
     ("profiles: {p: {port: 23}}", "needs a host"),
     ("profiles: {p: {host: h, port: 99999}}", "port"),
-    ("profiles: {p: {host: h, device_name: TOOLONGNAME1}}", "device_name"),
+    ("profiles: {p: {host: h, device_name: TOOLONGNAME1}}", "device name"),
     ("profiles: {p: {host: h, codepage: cp9999}}", "unknown code page"),
     ("profiles: {p: {host: h, on_reconnect: true}}", "needs an after_connect"),
     ("profiles: {p: {host: h, after_connect: {with: {}}}}", "after_connect is a flow"),

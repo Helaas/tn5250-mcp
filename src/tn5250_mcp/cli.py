@@ -120,7 +120,7 @@ def cmd_run(a) -> int:
     finally:
         if a.signoff:
             try:
-                t.signoff()
+                print("sign-off: %s" % t.signoff(), file=sys.stderr)
             except (TerminalError, OSError) as e:
                 print("sign-off: %s" % e, file=sys.stderr)
         t.close()

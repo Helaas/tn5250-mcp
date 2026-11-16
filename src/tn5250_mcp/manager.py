@@ -3,7 +3,9 @@ the MCP server and the web viewer."""
 
 from __future__ import annotations
 
+import collections
 import datetime as _dt
+import itertools
 import os
 import secrets as _secrets
 import threading
@@ -89,6 +91,9 @@ class Manager:
         self.reconnect_interval = reconnect_interval
         self.record_dir = record_dir
         self.recorders: dict = {}                   # session -> Recorder
+        self.memlogs: dict[str, collections.deque] = {}   # session -> recent log entries
+        self.logfiles: dict[str, str] = {}
+        self._devseq: dict[str, object] = {}        # device name pattern -> letters
         self.name_taken = lambda name: False        # set by the MCP server: tool names in use
         self.flow_runner = None                     # runs profiles' after_connect flows
         self.on_recorded = None                     # set by the MCP server: register a flow
@@ -140,18 +145,52 @@ class Manager:
 
     # -- logging -------------------------------------------------------------
     def _logger(self, name: str):
-        if not self.log_dir:
-            return lambda *a: None
-        os.makedirs(self.log_dir, exist_ok=True)
-        path = os.path.join(self.log_dir, "%s-%s.log" % (
-            name, _dt.datetime.now().strftime("%Y%m%d-%H%M%S")))
+        """Transcript of one connection: kept in memory (get_session_log) and,
+        with a log dir, written to a file. Values are masked before they get
+        here (hidden fields, secrets)."""
+        mem = self.memlogs[name] = collections.deque(maxlen=400)
+        path = None
+        if self.log_dir:
+            os.makedirs(self.log_dir, exist_ok=True)
+            path = os.path.join(self.log_dir, "%s-%s.log" % (
+                name, _dt.datetime.now().strftime("%Y%m%d-%H%M%S")))
+            self.logfiles[name] = path
         lock = threading.Lock()
 
         def log(kind: str, text: str) -> None:
-            with lock, open(path, "a", encoding="utf-8") as fh:
-                fh.write("[%s] %s\n%s\n\n" % (_dt.datetime.now().isoformat(timespec="seconds"),
-                                              kind, text))
+            ts = _dt.datetime.now().isoformat(timespec="seconds")
+            with lock:
+                mem.append((ts, kind, text))
+                if path:
+                    with open(path, "a", encoding="utf-8") as fh:
+                        fh.write("[%s] %s\n%s\n\n" % (ts, kind, text))
         return log
+
+    def session_log(self, name: str, last: int = 20, screens: bool = False) -> str:
+        mem = self.memlogs.get(name)
+        if mem is None:
+            raise GuardError("no log for session %r" % name)
+        entries = [e for e in mem if screens or e[1] != "screen"][-max(1, last):]
+        head = "last %d entries of session %s%s" % (
+            len(entries), name, " (file: %s)" % self.logfiles[name]
+            if name in self.logfiles else "")
+        return head + "".join("\n[%s] %s\n%s" % (ts, kind, text.rstrip()) for ts, kind, text
+                              in entries)
+
+    def device_name(self, pattern: str | None) -> str | None:
+        """Expand a device name pattern (* and =) for one connection."""
+        if not pattern:
+            return None
+        from .profiles import check_device_name, expand_device_name
+        try:
+            p = check_device_name(pattern)
+        except ValueError as e:
+            raise GuardError(str(e)) from None
+        if "*" not in p and "=" not in p:
+            return p
+        with self.lock:
+            seq = self._devseq.setdefault(p, itertools.cycle("ABCDEFGHIJKLMNOPQRSTUVWXYZ"))
+        return expand_device_name(p, seq)
 
     def log(self, s: Session, kind: str, text: str) -> None:
         s.log(kind, text)
@@ -178,7 +217,7 @@ class Manager:
 
     def connect(self, name: str, host: str, port: int, tls: bool, verify_tls: bool,
                 device_name: str | None, wide: bool, codepage: str | None,
-                timeout: float) -> Session:
+                timeout: float, expand: bool = True) -> Session:
         try:
             self.guard.check_host(host)
         except PermissionError as e:
@@ -190,6 +229,9 @@ class Manager:
                                  "first or pick another session name" % (name, old.host))
             if old:
                 old.close()                   # stops a pending auto-reconnect too
+        if expand:
+            device_name = self.device_name(device_name)
+        with self.lock:
             s = Session(name, host, port, tls=tls, verify_tls=verify_tls,
                         device_name=device_name, wide=wide,
                         codepage=codepage or self.default_codepage, log=self._logger(name))
@@ -205,7 +247,8 @@ class Manager:
         """Connect with a saved profile, then run its after_connect flow. A flow
         that doesn't finish leaves the session connected; the note says why."""
         s = self.connect(name, profile.host, profile.port, profile.tls, profile.verify_tls,
-                         profile.next_device_name(), profile.wide, profile.codepage, timeout)
+                         profile.next_device_name(), profile.wide, profile.codepage, timeout,
+                         expand=False)
         s.profile = profile
         s.log("profile", profile.summary())
         note = self.run_after_connect(s) if profile.after_connect else None
@@ -332,12 +375,39 @@ class Manager:
         s.log("record", "stopped" + (" -> %s" % (path or name) if name else " (discarded)"))
         return text, path
 
-    def disconnect(self, name: str) -> None:
+    def signoff(self, s: Session, timeout: float = 15.0) -> str:
+        """Sign off from the screen's CL command line. Returns what happened;
+        never raises for screens it can't sign off from."""
+        if not s.connected:
+            return "not connected, nothing to sign off"
+        if s.on_signon_screen():
+            return "not signed on (sign-on screen), nothing to sign off"
+        if s.keyboard_state() == "error":
+            self.press(s, "Reset")
+        if s.keyboard_state() == "busy":
+            s.wait(timeout=timeout)
+        ref = s.command_line()
+        if not ref:
+            return ("not signed off: this screen has no command line, so the job may stay "
+                    "active on the host until it notices the disconnect; go back to a menu "
+                    "first for a clean sign-off")
+        try:
+            self.press(s, "Enter", {ref: "SIGNOFF"}, None, None, s.screen_id(), True, None,
+                       timeout)
+        except GuardError as e:
+            return "not signed off: %s" % e
+        if not s.connected or s.on_signon_screen():
+            return "signed off"
+        return "typed SIGNOFF, but the host shows %r" % s.rows()[0].strip()
+
+    def disconnect(self, name: str, signoff: bool = False) -> str | None:
         s = self.get(name)
+        note = self.signoff(s) if signoff else None
         s.close()
-        s.log("disconnect", "")
+        s.log("disconnect", note or "")
         with self.lock:
             self.sessions.pop(name, None)
+        return note
 
     # -- guard -----------------------------------------------------------------
     def check_screen(self, s: Session, expect: str | None, screen_id: str | None) -> None:
@@ -366,6 +436,7 @@ class Manager:
         with s.cond:
             if not from_viewer:
                 self.check_screen(s, expect, screen_id)
+            shown = self.masked(s, values, mask)    # decided on this screen, before typing
             try:
                 s.fill(values, from_viewer=from_viewer)
             except (FieldError, ProtocolError) as e:
@@ -373,8 +444,7 @@ class Manager:
             rec = self.recorders.get(s.name)
             if rec:
                 rec.on_fill(s, values)
-        s.log("fill" + (" (viewer)" if from_viewer else ""),
-              repr(self.masked(s, values, mask)))
+        s.log("fill" + (" (viewer)" if from_viewer else ""), repr(shown))
 
     def press(self, s: Session, key: str, values: dict[str, str] | None = None,
               cursor: str | None = None, expect=None, screen_id=None,
@@ -393,6 +463,9 @@ class Manager:
                 self.check_screen(s, expect, screen_id)
             if rec:
                 step = rec.before_press(s, key, values, cursor)
+            # which values to mask is decided on this screen: once the key is sent the
+            # host may already have replaced it, and the password field with it
+            shown = self.masked(s, values, mask)
             try:
                 if values:
                     s.fill(values, from_viewer=from_viewer)
@@ -402,7 +475,7 @@ class Manager:
             except (FieldError, ProtocolError) as e:
                 raise GuardError(str(e)) from None
         s.log("press %s%s" % (key, " (viewer)" if from_viewer else ""),
-              "values=%r cursor=%r" % (self.masked(s, values, mask), cursor))
+              "values=%r cursor=%r" % (shown, cursor))
         ok = True
         if (wait or step) and norm_key(key) != "reset":
             time.sleep(0.05)
