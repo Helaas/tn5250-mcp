@@ -995,3 +995,13 @@ DBCS and printer sessions aren't covered either.
 
 The open-source [tn5250](https://github.com/tn5250/tn5250) emulator was used
 as the protocol reference.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
+
+The SQL, IFS, command and compile tools use JTOpen (`jt400.jar`), which has
+its own license (IBM Public License 1.0) and isn't part of this repository:
+you download it yourself (see [SQL and IFS](#sql-and-ifs-host-servers)). The
+bundled `t5250-helper.jar` holds only this project's own classes, built from
+[T5250Helper.java](src/tn5250_mcp/java/T5250Helper.java).
