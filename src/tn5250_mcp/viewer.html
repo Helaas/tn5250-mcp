@@ -1,0 +1,220 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>5250 Viewer</title>
+<style>
+  :root { --bg:#0b0d0c; --panel:#161a18; --text:#d6dbd8; --muted:#8a938e; --line:#2a302d;
+          --green:#4ade80; --white:#f5f5f5; --red:#f87171; --turquoise:#22d3ee;
+          --yellow:#facc15; --pink:#f472b6; --blue:#60a5fa; --accent:#4ade80; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text);
+         font:14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { display:flex; flex-wrap:wrap; gap:12px; align-items:center; padding:10px 16px;
+           background:var(--panel); border-bottom:1px solid var(--line); }
+  header h1 { font-size:15px; margin:0 8px 0 0; font-weight:600; }
+  select, button { font:inherit; color:var(--text); background:#202623; border:1px solid var(--line);
+                   border-radius:6px; padding:4px 9px; cursor:pointer; }
+  button:hover { border-color:var(--accent); }
+  .pill { padding:2px 9px; border-radius:999px; font-size:12px; font-weight:600; background:#202623; }
+  .ready { color:#0b0d0c; background:var(--green); }
+  .busy { color:#0b0d0c; background:var(--yellow); }
+  .error { color:#0b0d0c; background:var(--red); }
+  .disconnected { background:#444; }
+  .meta { color:var(--muted); font-size:12px; }
+  main { padding:16px; overflow-x:auto; }
+  #scr { position:relative; font:15px/1.35 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+         white-space:pre; background:#000; padding:10px 12px; border-radius:8px;
+         border:1px solid var(--line); width:max-content; }
+  .row { height:1.35em; }
+  .ul { text-decoration:underline; text-underline-offset:2px; }
+  .rv { filter:invert(1); background:#000; }
+  #scr input { position:absolute; height:1.35em; padding:0; margin:0; border:0; outline:0;
+               background:rgba(74,222,128,.08); color:var(--green); caret-color:var(--white);
+               font:inherit; border-bottom:1px solid var(--green); }
+  #scr input:focus { background:rgba(74,222,128,.18); }
+  #scr input.mono { text-transform:uppercase; }
+  #keys { display:flex; flex-wrap:wrap; gap:6px; margin-top:12px; max-width:1100px; }
+  #keys button { min-width:46px; }
+  #msg { margin-top:10px; color:var(--red); min-height:1.4em; }
+  #empty { color:var(--muted); padding:40px 16px; }
+  .help { color:var(--muted); font-size:12px; margin-top:8px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>5250 viewer</h1>
+  <select id="sess" aria-label="Session"></select>
+  <span id="kb" class="pill">-</span>
+  <span id="info" class="meta"></span>
+  <button id="reconnect" hidden>Reconnect</button>
+</header>
+<main>
+  <div id="empty">No session yet. Ask Claude to connect, then this page shows it live.</div>
+  <div id="scr" hidden></div>
+  <div id="keys" hidden></div>
+  <div id="msg" role="status"></div>
+  <div class="help" id="help" hidden>Type into the fields, press Enter or F-keys (Shift+F1-F12 = F13-F24),
+    PageUp/PageDown to roll, Esc = Reset. Passwords you type here go straight to the host;
+    Claude is never shown hidden fields.</div>
+</main>
+<script>
+const token = new URLSearchParams(location.search).get("token") || "";
+const $ = (id) => document.getElementById(id);
+let current = null, lastId = null, dirty = {}, busy = false;
+const colors = {green:"var(--green)", white:"var(--white)", red:"var(--red)", turquoise:"var(--turquoise)",
+                yellow:"var(--yellow)", pink:"var(--pink)", blue:"var(--blue)", none:"transparent"};
+
+async function api(path, body) {
+  const opt = {headers: {"X-Token": token}};
+  if (body) { opt.method = "POST"; opt.body = JSON.stringify(body); opt.headers["Content-Type"] = "application/json"; }
+  const r = await fetch(path, opt);
+  return r.json();
+}
+
+function render(s) {
+  const scr = $("scr");
+  scr.textContent = "";
+  for (const runs of s.cells) {
+    const row = document.createElement("div"); row.className = "row";
+    for (const [text, color, ul, rv, hid] of runs) {
+      const sp = document.createElement("span");
+      sp.textContent = text;
+      sp.style.color = colors[color] || "var(--green)";
+      if (ul) sp.classList.add("ul");
+      if (rv) sp.classList.add("rv");
+      row.appendChild(sp);
+    }
+    scr.appendChild(row);
+  }
+  dirty = {};
+  let focusEl = null;
+  for (const f of s.fields) {
+    let offset = 0;
+    f.segments.forEach((seg, k) => {
+      const inp = document.createElement("input");
+      inp.dataset.field = f.id; inp.dataset.seg = k; inp.dataset.row = seg.row; inp.dataset.col = seg.col;
+      inp.maxLength = seg.length; inp.size = seg.length;
+      inp.style.left = `calc(12px + ${seg.col - 1}ch)`;
+      inp.style.top = `calc(10px + ${seg.row - 1} * 1.35em)`;
+      inp.style.width = `${seg.length}ch`;
+      inp.style.color = colors[f.attr.color] || "var(--green)";
+      inp.type = f.hidden ? "password" : "text";
+      inp.autocomplete = "off"; inp.spellcheck = false;
+      inp.setAttribute("aria-label", f.label || f.id);
+      if (f.monocase) inp.classList.add("mono");
+      inp.value = f.hidden ? "" : (f.value || "").padEnd(f.length).substr(offset, seg.length).replace(/\s+$/, "");
+      offset += seg.length;
+      inp.addEventListener("input", () => {
+        dirty[f.id] = true;
+        if (inp.value.length >= seg.length) focusNext(inp);
+      });
+      inp.addEventListener("keydown", onKey);
+      scr.appendChild(inp);
+      if (seg.row === s.cursor.row && s.cursor.col >= seg.col && s.cursor.col < seg.col + seg.length) {
+        focusEl = [inp, s.cursor.col - seg.col];
+      }
+    });
+  }
+  if (focusEl) { focusEl[0].focus(); try { focusEl[0].setSelectionRange(focusEl[1], focusEl[1]); } catch (e) {} }
+  else { const first = scr.querySelector("input"); if (first) first.focus(); }
+}
+
+function focusNext(inp) {
+  const all = [...$("scr").querySelectorAll("input")];
+  const i = all.indexOf(inp);
+  if (i >= 0 && i + 1 < all.length) all[i + 1].focus();
+}
+
+function collect() {
+  const values = {};
+  for (const id of Object.keys(dirty)) {
+    const segs = [...$("scr").querySelectorAll(`input[data-field="${id}"]`)];
+    values[id] = segs.map((el, k) => k < segs.length - 1 ? el.value.padEnd(el.maxLength) : el.value).join("").replace(/\s+$/, "");
+  }
+  let cursor = null;
+  const a = document.activeElement;
+  if (a && a.dataset && a.dataset.field) {
+    cursor = `${a.dataset.row},${Number(a.dataset.col) + (a.selectionStart || 0)}`;
+  }
+  return {values, cursor};
+}
+
+async function send(key) {
+  if (!current || busy) return;
+  busy = true;
+  const {values, cursor} = collect();
+  $("msg").textContent = "";
+  try {
+    const r = await api("/api/press", {session: current.session, key, values, cursor});
+    if (!r.ok) $("msg").textContent = r.error;
+  } catch (e) { $("msg").textContent = String(e); }
+  busy = false;
+  poll(true);
+}
+
+function onKey(e) {
+  let key = null;
+  if (e.key === "Enter") key = "Enter";
+  else if (/^F([1-9]|1[0-2])$/.test(e.key)) key = "F" + (Number(e.key.slice(1)) + (e.shiftKey ? 12 : 0));
+  else if (e.key === "PageUp") key = "PageUp";
+  else if (e.key === "PageDown") key = "PageDown";
+  else if (e.key === "Escape") key = "Reset";
+  if (key) { e.preventDefault(); send(key); }
+}
+document.addEventListener("keydown", (e) => { if (e.target.tagName !== "INPUT") onKey(e); });
+
+function buildKeys() {
+  const names = ["Enter", "Reset", "PageUp", "PageDown", "Help", "SysReq", "Attn"];
+  for (let i = 1; i <= 24; i++) names.push("F" + i);
+  for (const n of names) {
+    const b = document.createElement("button"); b.textContent = n;
+    b.addEventListener("mousedown", (e) => e.preventDefault()); // keep field focus
+    b.addEventListener("click", () => send(n));
+    $("keys").appendChild(b);
+  }
+}
+
+async function poll(force) {
+  let st;
+  try { st = await api("/api/state?session=" + encodeURIComponent($("sess").value || "")); }
+  catch (e) { $("kb").textContent = "viewer offline"; $("kb").className = "pill disconnected"; return; }
+  const sel = $("sess");
+  const names = st.sessions;
+  if (sel.options.length !== names.length || [...sel.options].some((o, i) => o.value !== names[i])) {
+    const keep = sel.value; sel.textContent = "";
+    for (const n of names) { const o = document.createElement("option"); o.value = o.textContent = n; sel.appendChild(o); }
+    if (names.includes(keep)) sel.value = keep;
+  }
+  const s = st.screen;
+  $("empty").hidden = !!s; $("scr").hidden = !s; $("keys").hidden = !s; $("help").hidden = !s;
+  if (!s) { $("kb").textContent = "-"; $("kb").className = "pill"; return; }
+  $("kb").textContent = s.keyboard; $("kb").className = "pill " + s.keyboard;
+  $("reconnect").hidden = s.keyboard !== "disconnected";
+  if (s.keyboard === "disconnected" && s.error) $("msg").textContent = "Disconnected: " + s.error;
+  $("info").textContent = `${s.host} · screen ${s.screen_id} · cursor ${s.cursor.row},${s.cursor.col}` +
+    (s.message_waiting ? " · message waiting" : "");
+  const key = s.session + "/" + s.screen_id;
+  const typing = Object.keys(dirty).length > 0;
+  if (force || key !== lastId && !(typing && current && current.session === s.session && current.screen_id.split(".")[0] === s.screen_id.split(".")[0])) {
+    current = s; lastId = key; render(s);
+  }
+}
+$("sess").addEventListener("change", () => poll(true));
+$("reconnect").addEventListener("click", async () => {
+  if (!current) return;
+  $("reconnect").disabled = true; $("msg").textContent = "Reconnecting…";
+  try {
+    const r = await api("/api/reconnect", {session: current.session});
+    $("msg").textContent = r.ok ? "" : r.error;
+  } catch (e) { $("msg").textContent = String(e); }
+  $("reconnect").disabled = false;
+  poll(true);
+});
+buildKeys();
+poll(true);
+setInterval(() => poll(false), 500);
+</script>
+</body>
+</html>
