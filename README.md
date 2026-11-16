@@ -39,7 +39,10 @@ python3 -m venv .venv && .venv/bin/pip install -e .
 ```
 
 Python 3.11+. Dependencies: the official `mcp` SDK (2.x) and PyYAML. For the
-optional SQL/IFS tools: Java 11+ and a JTOpen `jt400.jar` (see below).
+optional SQL/IFS tools: a JTOpen `jt400.jar` and Java 11+. No Java? Install
+with the `java` extra (`.venv/bin/pip install -e ".[java]"`): it brings
+[jdk4py](https://pypi.org/project/jdk4py/), OpenJDK packaged for pip (about
+30 MB, GPLv2 with Classpath exception), and the server uses it by itself.
 
 ## Hook it up
 
@@ -105,8 +108,10 @@ through the IBM Toolbox for Java, which **you supply**:
    `jt400.jar`: from [GitHub](https://github.com/IBM/JTOpen/releases) or Maven
    Central (`net.sf.jt400:jt400`). Don't take the copy inside IBM i Access
    Client Solutions: its licence doesn't allow using its parts on their own.
-2. Have Java 11 or newer (`brew install openjdk@21`). It's found by itself, or
-   pass `--java`.
+2. Have Java 11 or newer: either install the `java` extra (`pip install
+   "tn5250-mcp[java]"`, a Java runtime as a Python package), or use one you
+   have (`brew install openjdk@21`). It's found by itself in this order:
+   `--java`, `$T5250_JAVA`, `$JAVA_HOME`, the `java` extra, the system's.
 3. Start the server with `--jt400 /path/to/jt400.jar`.
 
 ```sh
@@ -137,8 +142,11 @@ it.
 - SQL text and write paths go through the block list (`QCMDEXC`, `DROP
   SCHEMA`, ...). The transcript (`get_session_log` with session `host-main`)
   records statements and file names, not file contents.
-- The work is done by a small Java helper, shipped as source and run straight
-  from it (no build step), which talks JSON to the server. In Python:
+- The work is done by a small Java helper that talks JSON to the server. It
+  ships compiled (`java/t5250-helper.jar`, our own classes only, for Java
+  11+), so a runtime without a compiler is enough. After changing
+  `T5250Helper.java`, rebuild it with `python scripts/build_helper.py
+  /path/to/jt400.jar` (a test checks the jar matches the source). In Python:
   `HostServers("jt400.jar").connect(...)`, `.query(...)`, `.ifs_read(...)`.
 
 ## Connection profiles

@@ -190,11 +190,42 @@ def test_write_tools_when_allowed(ifs, monkeypatch):
     hs.close()
 
 
-# ------------------------------------------------------------ the real helper
+# ------------------------------------------------------------ Java runtime, helper jar
+def test_helper_jar_matches_the_source():
+    """The shipped t5250-helper.jar must be built from the current source
+    (python scripts/build_helper.py JT400_JAR)."""
+    import hashlib
+    import zipfile
+    java = Path(__file__).resolve().parent.parent / "src" / "tn5250_mcp" / "java"
+    with zipfile.ZipFile(java / "t5250-helper.jar") as z:
+        manifest = z.read("META-INF/MANIFEST.MF").decode().replace("\r\n ", "").replace("\n ", "")
+        assert "T5250Helper.class" in z.namelist()
+    want = hashlib.sha256((java / "T5250Helper.java").read_bytes()).hexdigest()
+    assert "Source-SHA256: " + want in manifest, "rebuild: python scripts/build_helper.py JAR"
+
+
+def test_uses_the_jdk4py_runtime(tmp_path, monkeypatch):
+    import types
+    fake = tmp_path / "java"
+    fake.write_text('#!/bin/sh\necho \'openjdk version "25.0.5" 2026-10-20\' >&2\n')
+    fake.chmod(0o755)
+    monkeypatch.setitem(sys.modules, "jdk4py", types.SimpleNamespace(
+        JAVA=fake, JAVA_HOME=tmp_path, JAVA_VERSION=(25, 0, 5)))
+    for v in ("T5250_JAVA", "JAVA_HOME"):
+        monkeypatch.delenv(v, raising=False)
+    assert find_java() == str(fake)
+    jar = tmp_path / "jt400.jar"
+    jar.write_bytes(b"")
+    cmd = helper_command(str(jar))
+    assert cmd[0] == str(fake) and cmd[-1] == "T5250Helper"
+    assert cmd[cmd.index("-cp") + 1].endswith("t5250-helper.jar" + os.pathsep + str(jar))
+
+
 @pytest.mark.skipif(not os.environ.get("T5250_TEST_JT400"),
                     reason="set T5250_TEST_JT400 to a JTOpen jar to check the Java helper")
 def test_java_helper_starts():
-    cmd = helper_command(os.environ["T5250_TEST_JT400"])
+    # T5250_TEST_JAVA picks the runtime, e.g. jdk4py's (which has no compiler)
+    cmd = helper_command(os.environ["T5250_TEST_JT400"], os.environ.get("T5250_TEST_JAVA"))
     p = subprocess.run(cmd, input='{"id":1,"op":"ping"}\n{"id":2,"op":"query","name":"x"}\n',
                        capture_output=True, text=True, timeout=120)
     lines = p.stdout.splitlines()

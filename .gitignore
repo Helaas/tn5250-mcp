@@ -7,3 +7,4 @@ build/
 logs/
 .pytest_cache/
 *.jar
+!src/tn5250_mcp/java/t5250-helper.jar

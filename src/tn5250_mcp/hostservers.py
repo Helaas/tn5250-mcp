@@ -3,8 +3,10 @@ servers), using the IBM Toolbox for Java (jt400 / JTOpen) that the user
 supplies. tn5250-mcp doesn't ship it: get JTOpen (open source, IBM Public
 License) and pass --jt400 /path/to/jt400.jar.
 
-A small Java helper (java/T5250Helper.java, run as a single-file program, so
-Java 11+ but no build step) does the work; this module starts it, talks JSON
+A small Java helper (java/T5250Helper.java, shipped compiled as
+java/t5250-helper.jar, so any Java 11+ runtime runs it; no compiler needed)
+does the work. No Java installed? `pip install "tn5250-mcp[java]"` brings one
+(jdk4py, OpenJDK as a Python package), which is then used automatically; this module starts it, talks JSON
 lines to it, and applies the rules:
 
 - queries run on a connection the database server itself keeps read-only;
@@ -31,6 +33,7 @@ from pathlib import Path
 
 JTOPEN_URL = "https://github.com/IBM/JTOpen/releases"
 HELPER = "T5250Helper.java"
+HELPER_JAR = "t5250-helper.jar"
 _JAVA_HOMEBREW = ["/opt/homebrew/opt/openjdk/bin/java", "/usr/local/opt/openjdk/bin/java"]
 
 
@@ -50,9 +53,19 @@ def java_version(java: str) -> int:
     return int(m.group(2) or 0) if major == 1 else major       # "1.8" -> 8
 
 
+def jdk4py_java() -> str | None:
+    """The Java runtime of the jdk4py package (pip install "tn5250-mcp[java]")."""
+    try:
+        import jdk4py
+    except ImportError:
+        return None
+    java = str(jdk4py.JAVA)
+    return java if os.path.exists(java) and tuple(jdk4py.JAVA_VERSION) >= (11,) else None
+
+
 def find_java(explicit: str | None = None) -> str:
-    """A Java 11+ runtime: --java / $T5250_JAVA, $JAVA_HOME, macOS java_home,
-    Homebrew, then PATH."""
+    """A Java 11+ runtime: --java / $T5250_JAVA, $JAVA_HOME, the jdk4py
+    package, macOS java_home, Homebrew, then PATH."""
     if explicit:
         if os.path.exists(explicit) and java_version(explicit) >= 11:
             return explicit
@@ -62,6 +75,9 @@ def find_java(explicit: str | None = None) -> str:
         cands.append(os.environ["T5250_JAVA"])
     if os.environ.get("JAVA_HOME"):
         cands.append(os.path.join(os.environ["JAVA_HOME"], "bin", "java"))
+    bundled = jdk4py_java()
+    if bundled:
+        cands.append(bundled)
     if os.path.exists("/usr/libexec/java_home"):
         try:
             home = subprocess.run(["/usr/libexec/java_home", "-v", "11+"], capture_output=True,
@@ -82,8 +98,9 @@ def find_java(explicit: str | None = None) -> str:
         seen.add(c)
         if java_version(c) >= 11:
             return c
-    raise HostServerError("no Java 11 or newer runtime found; install one (e.g. brew install "
-                          "openjdk@21) or pass --java /path/to/bin/java")
+    raise HostServerError("no Java 11 or newer runtime found: pip install \"tn5250-mcp[java]\" "
+                          "brings one, or install one (e.g. brew install openjdk@21), or pass "
+                          "--java /path/to/bin/java")
 
 
 class Helper:
@@ -152,8 +169,14 @@ class Helper:
 def helper_command(jar: str, java: str | None = None) -> list[str]:
     if not os.path.isfile(jar):
         raise HostServerError("jt400 jar not found: %s (get JTOpen: %s)" % (jar, JTOPEN_URL))
-    src = resources.files("tn5250_mcp").joinpath("java", HELPER)
-    return [find_java(java), "-Xshare:auto", "-Djava.awt.headless=true", "-cp", jar, str(src)]
+    here = resources.files("tn5250_mcp").joinpath("java")
+    base = [find_java(java), "-Xshare:auto", "-Djava.awt.headless=true"]
+    helper_jar = here.joinpath(HELPER_JAR)
+    if helper_jar.is_file():                  # compiled: runs on any Java 11+ runtime
+        return base + ["-cp", str(helper_jar) + os.pathsep + jar, "T5250Helper"]
+    # a source checkout without the jar: Java compiles the helper as it starts
+    # (needs a full JDK; see scripts/build_helper.py)
+    return base + ["-cp", jar, str(here.joinpath(HELPER))]
 
 
 def norm_ifs_path(path: str) -> str:
