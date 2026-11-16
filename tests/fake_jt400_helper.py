@@ -13,6 +13,16 @@ LIBL = []
 EVF = {}
 MEMBERS = {}
 SPOOL = []
+SRC = {("BOBLIB", "QRPGLESRC", "HELLO"): [["1.00", 240101, "**free"],
+                                         ["2.00", 240101, "dsply 'hi';"],
+                                         ["3.00", 240101, "*inlr = *on;"]]}
+SRC_FILE = os.path.join(ROOT, ".fake-members.json")     # members outlive one helper
+if os.path.exists(SRC_FILE):
+    SRC = {tuple(k.split("/")): v for k, v in json.load(open(SRC_FILE)).items()}
+
+
+def save_src():
+    json.dump({"/".join(k): v for k, v in SRC.items()}, open(SRC_FILE, "w"))
 JOBPOLL = [0]
 EXPIRED = set(os.environ.get("FAKE_EXPIRED", "").split(",")) - {""}
 
@@ -97,6 +107,24 @@ def handle(r):
                         "severity": 50 if bad else 0, "type": 15 if bad else 2,
                         "text": "Compilation stopped. Severity 30 errors found in program."
                         if bad else "Program %s placed in library %s." % (obj, lib)}])
+        if cmd.startswith("QSH CMD("):              # run the PASE wrapper with a local sh
+            import re as _re
+            import subprocess as _sp
+            d = _re.search(r"sh (/tmp/t5250-\w+)/run\.sh", cmd).group(1)
+            script = open(real(d + "/run.sh")).read().replace(d, real(d)).replace(
+                "/QOpenSys/usr/bin/sh", "/bin/sh").replace("PATH=", "PATH=/bin:", 1).replace(
+                "cd '/", "cd '%s/" % ROOT)
+            _sp.run(["/bin/sh", "-c", script], timeout=60)
+            return dict(res, ok=True, messages=[{"id": "QSH0005", "severity": 0, "type": 2,
+                        "text": "Command ended normally with exit status 0."}])
+        if cmd.startswith(("ADDPFM", "CHGPFM")):
+            m = __import__("re").search(r"FILE\((\w+)/(\w+)\) MBR\((\w+)\)", cmd)
+            if m.group(2) == "NOFILE":
+                return dict(res, ok=False, messages=[{"id": "CPF7301", "severity": 40,
+                            "type": 15, "text": "File NOFILE in BOBLIB not found."}])
+            SRC.setdefault(m.groups(), [])
+            save_src()
+            return dict(res, ok=True, messages=[])
         if cmd.startswith("CPYFRMSTMF"):
             m = __import__("re").search(r"FROMSTMF\('([^']+)'\) TOMBR\('/QSYS.LIB/(\w+).LIB/"
                                         r"(\w+).FILE/(\w+).MBR'\)", cmd)
@@ -136,6 +164,36 @@ def handle(r):
                 else sum(nums) for p in r["params"]]
         return {"ok": True, "outputs": outs, "job": "654321/QUSER/QZRCSRVS",
                 "messages": [], "libl": list(LIBL) or None}
+    if op == "ifs_delete":
+        import shutil as _sh
+        _sh.rmtree(real(r["path"]), ignore_errors=True)
+        return True
+    if op == "read_source":
+        k = (r["lib"], r["file"], r["member"])
+        if k not in SRC:
+            raise Exception("SQL0204: %s in %s type *FILE not found." % (r["file"], r["lib"]))
+        return {"lines": SRC[k], "width": 100, "truncated": False}
+    if op == "write_source":
+        k = (r["lib"], r["file"], r["member"])
+        for i, (_, t) in enumerate(r["lines"], 1):
+            if len(t) > 100:
+                raise Exception("line %d is %d characters; this source file holds 100"
+                                % (i, len(t)))
+        SRC[k] = [["%d.00" % i, d, t] for i, (d, t) in enumerate(r["lines"], 1)]
+        save_src()
+        return {"lines": len(r["lines"]), "width": 100}
+    if op == "query" and "SYSPARTITIONSTAT" in r["sql"]:
+        lib, file = r["params"][:2]
+        like = r["params"][2].replace("%", "") if len(r["params"]) > 2 else ""
+        rows = [[m, "RPGLE", "", str(len(v)), "2026-11-16 12:00:00"]
+                for (l, f, m), v in sorted(SRC.items()) if (l, f) == (lib, file)
+                and m.startswith(like)]
+        return {"columns": ["MEMBER", "TYPE", "TEXT", "LINES", "CHANGED"], "types": [],
+                "rows": rows, "truncated": False}
+    if op == "query" and "FILE_TYPE = 'S'" in r["sql"]:
+        files = sorted({f for (l, f, _) in SRC if l == r["params"][0]})
+        return {"columns": ["FILE", "TEXT", "WIDTH"], "types": [],
+                "rows": [[f, None, "100"] for f in files], "truncated": False}
     if op == "ifs_mkdir":
         os.makedirs(real(r["path"]), exist_ok=True)
         return True

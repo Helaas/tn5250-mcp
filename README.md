@@ -91,6 +91,9 @@ claude mcp add --transport http tn5250 http://127.0.0.1:8250/mcp
 | `compile` | compile a source and get its errors as file:line:column (only into `--allow-compile` libraries) |
 | `call_program` | call a program with typed parameters, get the output parameters back (only with `--allow-commands`) |
 | `build_project` | upload a local project folder and build what changed, errors as local file:line:column |
+| `pase` | run a PASE shell command (git, make, python3, `system`), get exit code, stdout, stderr (only with `--allow-shell`) |
+| `source_members`, `member_read` | list source files and members, read a member |
+| `member_write` | replace or create a source member (only in `--allow-member-write` libraries) |
 | `job_log` | a job's messages: why a command, compile or batch job failed |
 | `spooled_files`, `spooled_file` | list and read printed output: reports, listings, job logs |
 | `list_sessions`, `keys` | housekeeping |
@@ -230,6 +233,57 @@ come back as strings so no digits are lost. The call runs in the same job as
 `QCMDEXC` and `QCAPCMD` are on the block list, so a call can't run commands
 around it. From a shell: `tn5250-run call MYLIB/CALC "char(10)=Ada"
 "packed(7,2)=12.25" "packed(7,2)=0.5" "packed(9,2):out" "char(20):out"`.
+
+### The PASE shell
+
+`pase` (with `--allow-shell`) runs a command in PASE, IBM i's AIX runtime,
+with `/QOpenSys/usr/bin/sh` and `/QOpenSys/pkgs/bin` first on the `PATH`. So
+the open-source tools work where they're installed (on PUB400: git, make,
+python3, node), and so does `system "CL command"`.
+
+```text
+pase {"command": "git status --short", "cwd": "/home/ME/hello"}
+→ exit 0
+  --- stdout
+   M src/main.rpgle
+```
+
+- It runs in the same job as `run_command` and `call_program`, so `libl`
+  applies to `system` and to Db2 calls.
+- `timeout` (default 60 s, at most 3600) kills the command and everything it
+  started. stdin is empty, so nothing can wait for input.
+- Output comes back as UTF-8 text, up to 100,000 bytes per stream.
+- The command goes through the block list, like CL commands, so
+  `system PWRDWNSYS` is refused. The shell itself can still do anything your
+  user profile can, which is why it is off unless you turn it on.
+- How it works: the command and a small wrapper go to a fresh folder under
+  `/tmp`, which is deleted afterwards. `QSH` starts the wrapper, which records
+  the exit code and runs a watchdog for the timeout. Each call takes about
+  three seconds on PUB400.
+- From a shell: `tn5250-run sh "make -C /home/ME/hello" --profile pub400`
+  prints stdout and stderr and exits with the command's exit code.
+
+### Source members
+
+Not every shop keeps source in the IFS. `source_members` lists a library's
+source files, or one file's members with their type, text, number of lines
+and last change. `member_read` returns a member as text (`numbers: true`
+shows sequence numbers and dates, SEU style). `member_write` (with
+`--allow-member-write LIB[,LIB]`) replaces a member's text, creating the
+member with `type` and `description` if it doesn't exist.
+
+- Lines that didn't change keep their date, and new or changed lines get
+  today's, as SEU does, so the member's history still shows what changed.
+  The result says how many lines changed.
+- A line wider than the source file (record length - 12) is refused before
+  anything is written.
+- `compile` takes a member as its source (`MYLIB/QRPGLESRC(HELLO)`). Without
+  `type`, it uses the member's source type (RPGLE, SQLRPGLE, CLLE, CLP, DSPF,
+  PRTF, PF, LF).
+- From a shell: `tn5250-run member list MYLIB/QRPGLESRC`,
+  `tn5250-run member read MYLIB/QRPGLESRC(HELLO) hello.rpgle` and
+  `tn5250-run member write MYLIB/QRPGLESRC(HELLO) hello.rpgle --type RPGLE`
+  (stdin and stdout when there is no file).
 
 ## Building a project
 
@@ -769,6 +823,8 @@ listens on 127.0.0.1 and needs the random token, and it checks the Host header.
 | `--ifs-write-root DIR` (repeatable) | `T5250_IFS_WRITE_ROOT` (`:`-separated) | no `ifs_write` |
 | `--allow-commands` | `T5250_ALLOW_COMMANDS=1` | no `run_command`, `call_program` |
 | `--command-allow "DSP*,CALL"` | `T5250_COMMAND_ALLOW` | any command (block list still applies) |
+| `--allow-shell` | `T5250_ALLOW_SHELL=1` | no `pase` |
+| `--allow-member-write LIB[,LIB]` | `T5250_ALLOW_MEMBER_WRITE` | no `member_write`; `*` = any library |
 | `--allow-compile LIB[,LIB]` | `T5250_ALLOW_COMPILE` | no `compile`, `build_project` (which also needs `--ifs-write-root`); `*` = any library |
 
 ## Examples and tests

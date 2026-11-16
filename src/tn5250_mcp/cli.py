@@ -240,6 +240,56 @@ def cmd_call(a) -> int:
     return 0 if res["ok"] else 1
 
 
+def cmd_sh(a) -> int:
+    from .hostservers import HostServerError
+    try:
+        hs = _host(a, allow_shell=True)
+        res = hs.pase("cli", a.command, a.cwd, a.timeout)
+    except HostServerError as e:
+        print("FAILED %s" % e, file=sys.stderr)
+        return 3
+    if a.json:
+        print(json.dumps(res))
+    else:
+        sys.stdout.write(res["stdout"])
+        sys.stderr.write(res["stderr"])
+        if res["timed_out"]:
+            print("timed out after %ds" % a.timeout, file=sys.stderr)
+    hs.close()
+    return res["exit_code"] if 0 <= res["exit_code"] < 256 else 1
+
+
+def cmd_member(a) -> int:
+    from .hostservers import HostServerError, format_table, split_member
+    try:
+        if a.action == "write":
+            lib = split_member(a.member)[0]
+            text = sys.stdin.read() if a.file in (None, "-") else open(a.file, encoding="utf-8").read()
+            hs = _host(a, member_write_libs=[lib])
+            res = hs.member_write("cli", a.member, text, a.type, a.text)
+            print("%s %s: %d lines (%d new or changed)" % (
+                "created" if res["created"] else "wrote", res["member"], res["lines"],
+                res["changed_lines"]), file=sys.stderr)
+        elif a.action == "read":
+            hs = _host(a)
+            res = hs.member_read("cli", a.member)
+            out = "".join(t + "\n" for _, _, t in res["lines"])
+            if a.file and a.file != "-":
+                open(a.file, "w", encoding="utf-8").write(out)
+            else:
+                sys.stdout.write(out)
+        else:
+            hs = _host(a)
+            lib, _, file = a.member.upper().partition("/")
+            res = hs.members("cli", lib, file) if file else hs.source_files("cli", lib)
+            print(json.dumps(res) if a.json else format_table(res))
+    except (HostServerError, OSError) as e:
+        print("FAILED %s" % e, file=sys.stderr)
+        return 3
+    hs.close()
+    return 0
+
+
 def cmd_build(a) -> int:
     from .build import BuildError, build, load_project, report_text
     from .hostservers import HostServerError
@@ -386,6 +436,23 @@ def main(argv: list[str] | None = None) -> None:
     b.add_argument("--only", action="append", metavar="OBJECT", help="build just this object")
     _host_args(b)
     b.set_defaults(fn=cmd_build)
+
+    sh = sub.add_parser("sh", help="run a PASE shell command; exits with its exit code")
+    sh.add_argument("command")
+    sh.add_argument("--cwd", help="IFS folder to run in")
+    sh.add_argument("--timeout", type=int, default=600)
+    _host_args(sh)
+    sh.set_defaults(fn=cmd_sh)
+
+    mb = sub.add_parser("member", help="list, read or write source members")
+    mb.add_argument("action", choices=["list", "read", "write"])
+    mb.add_argument("member", help="LIB/FILE(MEMBER); for list: LIB or LIB/FILE")
+    mb.add_argument("file", nargs="?", help="local file to write to (read) or from (write); "
+                                            "default stdout/stdin")
+    mb.add_argument("--type", help="source type for a new member (RPGLE, CLLE, ...)")
+    mb.add_argument("--text", help="member text")
+    _host_args(mb)
+    mb.set_defaults(fn=cmd_member)
 
     q = sub.add_parser("call", help="call a program with typed parameters")
     q.add_argument("program", help="NAME or LIB/NAME")

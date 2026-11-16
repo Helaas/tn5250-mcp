@@ -131,7 +131,10 @@ public class T5250Helper {
                 if (!d.exists()) throw new IllegalArgumentException("could not create " + d.getPath());
                 return made;
             }
+            case "ifs_delete": return ifsDelete(ifs(r));
             case "read_member": return readMember(r);
+            case "read_source": return readSource(r);
+            case "write_source": return writeSource(r);
             case "spooled_file": return spooledFile(r);
             case "close": {
                 Conn c = CONNS.remove(str(r, "name"));
@@ -444,6 +447,8 @@ public class T5250Helper {
         p.setProperty("prompt", "false");
         // e.g. compiler event files are CCSID 65535: read them as text, not hex
         p.setProperty("translate binary", "true");
+        // source files are usually not journaled: write them without commitment control
+        p.setProperty("transaction isolation", "none");
         c.internal = new AS400JDBCDriver().connect(c.system, p, null);
         c.internal.setAutoCommit(true);
         return c.internal;
@@ -479,6 +484,87 @@ public class T5250Helper {
         Map<String, Object> res = new LinkedHashMap<>();
         res.put("records", recs);
         return res;
+    }
+
+    /** A source member's lines with sequence numbers and dates. */
+    static Object readSource(Map<String, Object> r) throws Exception {
+        Conn c = conn(r);
+        String lib = sysName(r, "lib"), file = sysName(r, "file"), mbr = sysName(r, "member");
+        int max = num(r, "max_lines", 100000);
+        List<Object> lines = new ArrayList<>();
+        Map<String, Object> res = new LinkedHashMap<>();
+        try (Statement st = internal(c).createStatement()) {
+            st.execute("CREATE OR REPLACE ALIAS QTEMP/T5250SRC FOR " + lib + "/" + file + " (" + mbr + ")");
+            try (ResultSet rs = st.executeQuery(
+                    "SELECT SRCSEQ, SRCDAT, SRCDTA FROM QTEMP/T5250SRC ORDER BY SRCSEQ")) {
+                res.put("width", rs.getMetaData().getPrecision(3));
+                boolean more = false;
+                while (rs.next()) {
+                    if (lines.size() >= max) { more = true; break; }
+                    List<Object> l = new ArrayList<>();
+                    l.add(rs.getBigDecimal(1).toPlainString());
+                    l.add(rs.getInt(2));
+                    l.add(rtrim(rs.getString(3)));
+                    lines.add(l);
+                }
+                res.put("truncated", more);
+            }
+        }
+        res.put("lines", lines);
+        return res;
+    }
+
+    /** Replace a source member's lines: [[date, text], ...], numbered 1.00, 2.00, ... */
+    static Object writeSource(Map<String, Object> r) throws Exception {
+        Conn c = conn(r);
+        String lib = sysName(r, "lib"), file = sysName(r, "file"), mbr = sysName(r, "member");
+        List<?> lines = (List<?>) r.get("lines");
+        Connection db = internal(c);
+        try (Statement st = db.createStatement()) {
+            st.execute("CREATE OR REPLACE ALIAS QTEMP/T5250SRC FOR " + lib + "/" + file + " (" + mbr + ")");
+            int width;
+            try (ResultSet rs = st.executeQuery("SELECT SRCDTA FROM QTEMP/T5250SRC FETCH FIRST 1 ROW ONLY")) {
+                width = rs.getMetaData().getPrecision(1);
+            }
+            for (int i = 0; i < lines.size(); i++) {
+                String t = String.valueOf(((List<?>) lines.get(i)).get(1));
+                if (t.length() > width)
+                    throw new IllegalArgumentException("line " + (i + 1) + " is " + t.length()
+                            + " characters; this source file holds " + width);
+            }
+            BigDecimal step = lines.size() <= 9999 ? BigDecimal.ONE
+                    : lines.size() <= 99999 ? new BigDecimal("0.10") : new BigDecimal("0.01");
+            if (lines.size() > 999999) throw new IllegalArgumentException("too many lines for a member");
+            st.execute("DELETE FROM QTEMP/T5250SRC");
+            try (PreparedStatement ps = db.prepareStatement(
+                    "INSERT INTO QTEMP/T5250SRC (SRCSEQ, SRCDAT, SRCDTA) VALUES (?, ?, ?)")) {
+                BigDecimal seq = BigDecimal.ZERO;
+                for (Object o : lines) {
+                    List<?> l = (List<?>) o;
+                    seq = seq.add(step);
+                    ps.setBigDecimal(1, seq);
+                    ps.setInt(2, ((Number) l.get(0)).intValue());
+                    ps.setString(3, String.valueOf(l.get(1)));
+                    ps.addBatch();
+                }
+                if (!lines.isEmpty()) ps.executeBatch();
+            }
+            Map<String, Object> res = new LinkedHashMap<>();
+            res.put("lines", lines.size());
+            res.put("width", width);
+            return res;
+        }
+    }
+
+    /** Delete a file, or a folder with everything in it. */
+    static Object ifsDelete(IFSFile f) throws Exception {
+        if (!f.exists()) return false;
+        if (f.isDirectory()) {
+            IFSFile[] kids = f.listFiles();
+            if (kids != null) for (IFSFile k : kids) ifsDelete(k);
+        }
+        if (!f.delete()) throw new IllegalArgumentException("could not delete " + f.getPath());
+        return true;
     }
 
     /** Lines of a spooled file (SYSTOOLS.SPOOLED_FILE_DATA). */

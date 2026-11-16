@@ -33,6 +33,9 @@ EXTENSIONS = {
     ".rpgle": "rpg", ".sqlrpgle": "sqlrpg", ".clle": "cl", ".clp": "cl",
     ".dspf": "dspf", ".prtf": "prtf", ".pf": "pf", ".lf": "lf",
 }
+# member source type (SRCTYPE) -> type
+MEMBER_TYPES = {"RPGLE": "rpg", "SQLRPGLE": "sqlrpg", "CLLE": "cl", "CLP": "cl",
+                "DSPF": "dspf", "PRTF": "prtf", "PF": "pf", "LF": "lf"}
 SEVERITY = {"I": "info", "W": "warning", "E": "error", "S": "severe", "T": "terminal",
             "U": "unrecoverable"}
 
@@ -73,7 +76,8 @@ def kind_for(source: str, kind: str | None) -> str:
     ext = posixpath.splitext(source.strip().lower())[1]
     if ext in EXTENSIONS:
         return EXTENSIONS[ext]
-    raise CompileError("can't tell the source type from %r; pass type (%s)"
+    raise CompileError("can't tell the source type from %r (by its extension, or a "
+                       "member's source type); pass type (%s)"
                        % (source, ", ".join(KINDS)))
 
 

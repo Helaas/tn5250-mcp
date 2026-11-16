@@ -21,11 +21,14 @@ from __future__ import annotations
 
 import base64
 import collections
+import datetime
+import difflib
 import fnmatch
 import json
 import os
 import posixpath
 import re
+import secrets
 import shutil
 import subprocess
 import threading
@@ -230,6 +233,53 @@ def check_param(p, i: int = 1) -> dict:
     return {"type": t, "value": v, "out": bool(p.get("out"))}
 
 
+MEMBER = re.compile(r"^([A-Z$#@][A-Z0-9_$#@.]{0,9})/([A-Z$#@][A-Z0-9_$#@.]{0,9})"
+                    r"\(([A-Z$#@][A-Z0-9_$#@.]{0,9})\)$")
+
+
+def split_member(member: str) -> tuple[str, str, str]:
+    m = MEMBER.match(member.strip().upper())
+    if not m:
+        raise HostServerError("a member is LIB/FILE(MEMBER), e.g. MYLIB/QRPGLESRC(HELLO) "
+                              "(got %r)" % member)
+    return m.group(1), m.group(2), m.group(3)
+
+
+def source_dates(old: list[tuple[int, str]], new: list[str],
+                 today: int) -> tuple[list[tuple[int, str]], int]:
+    """SRCDAT per new line: kept where the line is unchanged, today otherwise;
+    and how many lines are new or changed."""
+    sm = difflib.SequenceMatcher(None, [t for _, t in old], new, autojunk=False)
+    dates: list[int | None] = [None] * len(new)
+    for a, b, n in sm.get_matching_blocks():
+        for k in range(n):
+            dates[b + k] = old[a + k][0]
+    changed = sum(1 for d in dates if d is None)
+    return [(today if d is None else d, t) for d, t in zip(dates, new)], changed
+
+
+def pase_runner(d: str, cwd: str | None, timeout: int) -> str:
+    """The wrapper QSH starts: PATH, working folder, redirection, exit code,
+    and a watchdog that kills the command (its process group) after timeout."""
+    q = (lambda x: "'" + x.replace("'", "'\\''") + "'")
+    return "\n".join([
+        'exec > %s/log 2>&1' % d,
+        'PATH=/QOpenSys/pkgs/bin:/QOpenSys/usr/bin:/usr/ccs/bin:/usr/bin:/usr/sbin',
+        'export PATH',
+        ('cd %s 2> %s/err || { echo 126 > %s/rc; exit 0; }' % (q(cwd), d, d)) if cwd else
+        'cd "${HOME:-/}" 2>/dev/null',
+        'set -m',
+        '/QOpenSys/usr/bin/sh %s/cmd.sh < /dev/null > %s/out 2> %s/err &' % (d, d, d),
+        'pid=$!',
+        '( sleep %d && { : > %s/timedout; kill -9 -$pid 2>/dev/null || kill -9 $pid; } ) '
+        '> /dev/null 2>&1 &' % (timeout, d),
+        'dog=$!',
+        'wait $pid',
+        'echo $? > %s/rc' % d,
+        'kill -9 $dog 2>/dev/null',
+        'exit 0', ""])
+
+
 def command_name(cmd: str) -> str:
     """CRTBNDRPG for 'QSYS/CRTBNDRPG PGM(...)'."""
     first = cmd.strip().split(None, 1)[0].upper() if cmd.strip() else ""
@@ -273,7 +323,8 @@ class HostServers:
                  guard=None, log=None, command: list[str] | None = None,
                  max_rows: int = 1000, max_read: int = 1_000_000,
                  allow_commands: bool = False, command_allow: list[str] | None = None,
-                 compile_libs: list[str] | None = None):
+                 compile_libs: list[str] | None = None, allow_shell: bool = False,
+                 member_write_libs: list[str] | None = None):
         self.java_command = command or helper_command(jar, java)
         self.helper = Helper(self.java_command)
         self.allow_sql_write = allow_sql_write
@@ -287,6 +338,10 @@ class HostServers:
         self.command_allow = [p.strip().upper() for p in (command_allow or []) if p.strip()]
         # compile: only into these libraries ("*" = any)
         self.compile_libs = [x.strip().upper() for x in (compile_libs or []) if x.strip()]
+        self.allow_shell = allow_shell             # PASE shell commands
+        # source members may be written only in these libraries ("*" = any)
+        self.member_write_libs = [x.strip().upper() for x in (member_write_libs or [])
+                                  if x.strip()]
 
     # -- connections ----------------------------------------------------------
     def connect(self, name: str, host: str, user: str, password: str, tls: bool = True,
@@ -472,6 +527,8 @@ class HostServers:
         the compiler's event file. Needs --allow-compile with that library."""
         from .compiler import CompileError, build_command, parse_events, split_object
         self._need(name)
+        if not kind and not source.strip().startswith("/"):
+            kind = self._member_kind(name, source)
         try:
             lib, objname = split_object(obj)
             cmd = build_command(source, obj, kind, options, listing)
@@ -508,6 +565,18 @@ class HostServers:
         self.log(name, "compile", "%s -> %s, %d diagnostics" % (
             cmd, "ok" if out["ok"] else "FAILED", len(events)))
         return out
+
+    def _member_kind(self, name: str, source: str) -> str | None:
+        """The compile type from a member's source type (RPGLE -> rpg, ...)."""
+        from .compiler import MEMBER_TYPES
+        try:
+            lib, file, mbr = split_member(source)
+            rows = self.members(name, lib, file, mbr)["rows"]
+        except HostServerError:
+            return None
+        t = next((str(r[1] or "").strip().upper() for r in rows
+                  if str(r[0]).strip() == mbr), "")
+        return MEMBER_TYPES.get(t)
 
     def _server_time(self, name: str) -> str:
         """The IBM i's clock as YYYYMMDDHHMMSS (to tell old event files from new)."""
@@ -568,6 +637,136 @@ class HostServers:
         self.log(name, "spooled file", "%s %s %s (%d lines)" % (job, file, number,
                                                                 len(res.get("lines", []))))
         return res
+
+    # -- PASE shell -----------------------------------------------------------------
+    def pase(self, name: str, command: str, cwd: str | None = None, timeout: int = 60,
+             libl: list[str] | None = None, max_bytes: int = 100_000) -> dict:
+        """Run a shell command in PASE (/QOpenSys/usr/bin/sh, with
+        /QOpenSys/pkgs/bin on the PATH: git, make, python, node, ...) in the
+        command job, so it sees the library list (e.g. the `system` command).
+        Returns exit code, stdout and stderr. Needs --allow-shell."""
+        self._need(name)
+        if not self.allow_shell:
+            raise HostServerError("the PASE shell is off on this server (start it with "
+                                  "--allow-shell)")
+        cmd = self._guard_command(command)
+        if not 1 <= int(timeout) <= 3600:
+            raise HostServerError("timeout is 1 to 3600 seconds")
+        where = norm_ifs_path(cwd) if cwd else None
+        d = "/tmp/t5250-" + secrets.token_hex(6)
+        self.helper.call("ifs_mkdir", name=name, path=d)
+        try:
+            self.helper.call("ifs_write", name=name, path=d + "/cmd.sh", text=cmd + "\n",
+                             ccsid=1208, overwrite=True, append=False)
+            self.helper.call("ifs_write", name=name, path=d + "/run.sh", ccsid=1208,
+                             overwrite=True, append=False,
+                             text=pase_runner(d, where, int(timeout)))
+            res = self._run_command(name, "QSH CMD('/QOpenSys/usr/bin/sh %s/run.sh')" % d, libl)
+
+            def read(f: str) -> tuple[str | None, bool]:
+                try:
+                    r = self.helper.call("ifs_read", name=name, path="%s/%s" % (d, f),
+                                         binary=True, max_bytes=max_bytes)
+                except HostServerError:
+                    return None, False
+                return (base64.b64decode(r["base64"]).decode("utf-8", "replace"),
+                        bool(r.get("truncated")))
+            rc, _ = read("rc")
+            if rc is None or not rc.strip().lstrip("-").isdigit():
+                raise HostServerError("the shell didn't run: %s" % "; ".join(
+                    "%s %s" % (m.get("id"), m.get("text")) for m in res.get("messages", []))
+                    or "no messages")
+            out, out_cut = read("out")
+            err, err_cut = read("err")
+            timed_out = read("timedout")[0] is not None
+        finally:
+            try:
+                self.helper.call("ifs_delete", name=name, path=d)
+            except HostServerError:
+                pass
+        err = re.sub(r"%s/run\.sh\[\d+\]: " % re.escape(d), "cd: ", err or "")
+        result = {"exit_code": int(rc.strip()), "stdout": out or "", "stderr": err,
+                  "timed_out": timed_out, "truncated": out_cut or err_cut,
+                  "cwd": where, "job": res.get("job")}
+        self.log(name, "pase", "%s%s\n-> exit %s%s" % (
+            cmd, " (in %s)" % where if where else "", result["exit_code"],
+            ", timed out" if timed_out else ""))
+        return result
+
+    # -- source members ------------------------------------------------------------
+    def source_files(self, name: str, lib: str) -> dict:
+        lib = check_libl([lib])[0]
+        return self.query(name, "SELECT RTRIM(SYSTEM_TABLE_NAME) AS FILE, TABLE_TEXT AS TEXT, "
+                          "ROW_LENGTH - 12 AS WIDTH FROM QSYS2.SYSTABLES "
+                          "WHERE SYSTEM_TABLE_SCHEMA = ? AND FILE_TYPE = 'S' ORDER BY 1",
+                          [lib], max_rows=1000)
+
+    def members(self, name: str, lib: str, file: str, pattern: str | None = None) -> dict:
+        lib = check_libl([lib])[0]
+        file = file.strip().upper()
+        if not LIBRARY.match(file):
+            raise HostServerError("not a file name: %r" % file)
+        sql = ("SELECT RTRIM(SYSTEM_TABLE_MEMBER) AS MEMBER, RTRIM(SOURCE_TYPE) AS TYPE, "
+               "PARTITION_TEXT AS "
+               "TEXT, NUMBER_ROWS AS LINES, LAST_SOURCE_UPDATE_TIMESTAMP AS CHANGED "
+               "FROM QSYS2.SYSPARTITIONSTAT WHERE SYSTEM_TABLE_SCHEMA = ? AND "
+               "SYSTEM_TABLE_NAME = ?")
+        params = [lib, file]
+        if pattern:
+            sql += " AND RTRIM(SYSTEM_TABLE_MEMBER) LIKE ?"      # CHAR(10): blanks count
+            params.append(pattern.strip().upper().replace("*", "%"))
+        return self.query(name, sql + " ORDER BY 1", params, max_rows=5000)
+
+    def member_read(self, name: str, member: str, max_lines: int = 100_000) -> dict:
+        self._need(name)
+        lib, file, mbr = split_member(member)
+        try:
+            res = self.helper.call("read_source", name=name, lib=lib, file=file, member=mbr,
+                                   max_lines=max_lines)
+        except HostServerError as e:
+            raise HostServerError("can't read %s/%s(%s): %s" % (lib, file, mbr, e)) from None
+        self.log(name, "member read", "%s/%s(%s): %d lines" % (lib, file, mbr,
+                                                                len(res["lines"])))
+        return dict(res, member="%s/%s(%s)" % (lib, file, mbr))
+
+    def member_write(self, name: str, member: str, text: str, srctype: str | None = None,
+                     description: str | None = None) -> dict:
+        """Replace a member's source (creating the member if needed). Lines that
+        didn't change keep their date; new and changed lines get today's."""
+        self._need(name)
+        lib, file, mbr = split_member(member)
+        if not self.member_write_libs:
+            raise HostServerError("writing source members is off on this server (start it "
+                                  "with --allow-member-write LIB[,LIB])")
+        if "*" not in self.member_write_libs and lib not in self.member_write_libs:
+            raise HostServerError("this server writes members only in %s, not %s"
+                                  % (", ".join(self.member_write_libs), lib))
+        if srctype and not LIBRARY.match(srctype.strip().upper()):
+            raise HostServerError("not a source type: %r" % srctype)
+        exists = any(str(r[0]).strip() == mbr
+                     for r in self.members(name, lib, file, mbr)["rows"])
+        if not exists or srctype or description is not None:
+            cl = "%s FILE(%s/%s) MBR(%s)" % ("CHGPFM" if exists else "ADDPFM", lib, file, mbr)
+            if srctype:
+                cl += " SRCTYPE(%s)" % srctype.strip().upper()
+            if description is not None:
+                cl += " TEXT('%s')" % description[:50].replace("'", "''")
+            res = self._run_command(name, self._guard_command(cl), None)
+            if not res.get("ok"):
+                raise HostServerError("%s failed: %s" % (cl.split()[0], "; ".join(
+                    "%s %s" % (m.get("id"), m.get("text")) for m in res.get("messages", []))))
+        old = self.helper.call("read_source", name=name, lib=lib, file=file,
+                               member=mbr)["lines"] if exists else []
+        new = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        if new and new[-1] == "":
+            new.pop()
+        lines, changed = source_dates([(int(d), t) for _, d, t in old], [x.rstrip() for x in new],
+                             int(datetime.date.today().strftime("%y%m%d")))
+        res = self.helper.call("write_source", name=name, lib=lib, file=file, member=mbr,
+                               lines=[[d, t] for d, t in lines])
+        self.log(name, "member write", "%s/%s(%s): %d lines" % (lib, file, mbr, len(lines)))
+        return {"member": "%s/%s(%s)" % (lib, file, mbr), "lines": len(lines),
+                "created": not exists, "width": res.get("width"), "changed_lines": changed}
 
     # -- IFS --------------------------------------------------------------------
     def ifs_list(self, name: str, path: str, max_entries: int = 500) -> dict:

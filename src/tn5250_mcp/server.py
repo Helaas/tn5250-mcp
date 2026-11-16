@@ -61,7 +61,8 @@ BUILTIN_TOOLS = {"connect", "disconnect", "list_sessions", "get_screen", "fill",
                  "get_session_log", "host_connect", "host_disconnect", "sql_query",
                  "sql_execute", "ifs_list", "ifs_read", "ifs_write", "forget_password",
                  "run_command", "compile", "job_log", "spooled_files", "spooled_file",
-                 "call_program", "build_project"}
+                 "call_program", "build_project", "pase", "source_members", "member_read",
+                 "member_write"}
 
 Session_ = Annotated[str, Field(description="session name; lets you run several side by side")]
 Conn_ = Annotated[str, Field(description="name of the host-server connection")]
@@ -604,6 +605,92 @@ def _add_host_tools(mcp: MCPServer, mgr: Manager, hs: HostServers, profiles: Pro
             annotations=ToolAnnotations(read_only_hint=False, destructive_hint=True,
                                         open_world_hint=True))
 
+    if hs.allow_shell and not read_only:
+        @mcp.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=True,
+                                              open_world_hint=True))
+        async def pase(
+            command: Annotated[str, Field(description="a shell command or script, e.g. "
+                                                      "\"cd src && git status\"")],
+            cwd: Annotated[str | None, Field(description="IFS folder to run in (default: "
+                                                         "your home folder)")] = None,
+            timeout: Annotated[int, Field(ge=1, le=3600, description="seconds; then the "
+                                                                    "command is killed")] = 60,
+            libl: Annotated[list[str] | None, Field(
+                description="library list to set first (for `system` and DB2 calls)")] = None,
+            name: Conn_ = "main",
+        ) -> str:
+            """Run a command in the IBM i PASE shell (/QOpenSys/usr/bin/sh) and return
+            its exit code, stdout and stderr. /QOpenSys/pkgs/bin comes first on the
+            PATH, so open-source tools (git, make, python3, node, ...) work when
+            installed. Runs in the command job: `system "CL command"` sees the
+            library list. Nothing interactive: stdin is empty."""
+            res = await run(hs.pase, name, command, cwd, timeout, libl)
+            parts = ["exit %d%s%s" % (res["exit_code"], " (timed out after %ds)" % timeout
+                                      if res["timed_out"] else "",
+                                      ", output truncated" if res["truncated"] else "")]
+            if res["stdout"]:
+                parts.append("--- stdout\n" + res["stdout"].rstrip("\n"))
+            if res["stderr"]:
+                parts.append("--- stderr\n" + res["stderr"].rstrip("\n"))
+            return "\n".join(parts)
+
+    @mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True))
+    async def source_members(
+        lib: Annotated[str, Field(description="library")],
+        file: Annotated[str | None, Field(description="source file, e.g. QRPGLESRC; leave "
+                                                      "out to list the library's source "
+                                                      "files")] = None,
+        pattern: Annotated[str | None, Field(description="member names, e.g. ORD*")] = None,
+        name: Conn_ = "main",
+    ) -> str:
+        """List a library's source files, or the members of one source file with
+        their type, text, size and last change."""
+        if file:
+            res = await run(hs.members, name, lib, file, pattern)
+        else:
+            res = await run(hs.source_files, name, lib)
+        return format_table(res) if res["rows"] else "(none)"
+
+    @mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True))
+    async def member_read(
+        member: Annotated[str, Field(description="LIB/FILE(MEMBER), e.g. "
+                                                 "MYLIB/QRPGLESRC(HELLO)")],
+        numbers: Annotated[bool, Field(description="show each line's sequence number and "
+                                                   "date (SEU style)")] = False,
+        name: Conn_ = "main",
+    ) -> str:
+        """Read a source member as text. Compile it with compile (source
+        LIB/FILE(MEMBER)); change it with member_write."""
+        res = await run(hs.member_read, name, member)
+        head = "%s: %d lines, %d wide%s" % (res["member"], len(res["lines"]), res["width"],
+                                           ", truncated" if res.get("truncated") else "")
+        if numbers:
+            body = ["%7s %06d %s" % (q, d, t) for q, d, t in res["lines"]]
+        else:
+            body = [t for _, _, t in res["lines"]]
+        return "\n".join([head] + body)
+
+    if hs.member_write_libs and not read_only:
+        @mcp.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=True,
+                                              open_world_hint=True))
+        async def member_write(
+            member: Annotated[str, Field(description="LIB/FILE(MEMBER)")],
+            text: Annotated[str, Field(description="the whole new source")],
+            type: Annotated[str | None, Field(description="source type for a new member "
+                                                          "(RPGLE, SQLRPGLE, CLLE, DSPF, "
+                                                          "PF, ...) or to change it")] = None,
+            description: Annotated[str | None, Field(description="member text (50 "
+                                                                 "characters)")] = None,
+            name: Conn_ = "main",
+        ) -> str:
+            """Replace a source member's text, creating the member if it doesn't exist.
+            Unchanged lines keep their date, changed lines get today's (as SEU
+            does). Lines may not be wider than the source file."""
+            res = await run(hs.member_write, name, member, text, type, description)
+            return "%s %s: %d lines (%d new or changed), %d wide" % (
+                "created" if res["created"] else "wrote", res["member"], res["lines"],
+                res["changed_lines"], res["width"])
+
     @mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True))
     async def job_log(
         job: Annotated[str | None, Field(
@@ -798,6 +885,11 @@ def main(argv: list[str] | None = None) -> None:
                    help="with --allow-commands: only these commands (e.g. 'DSP*,WRK*,CALL')")
     p.add_argument("--allow-compile", default=os.environ.get("T5250_ALLOW_COMPILE", ""),
                    help="offer compile, into these libraries (comma list, * = any)")
+    p.add_argument("--allow-shell", action="store_true",
+                   default=os.environ.get("T5250_ALLOW_SHELL") == "1",
+                   help="offer pase (shell commands in PASE)")
+    p.add_argument("--allow-member-write", default=os.environ.get("T5250_ALLOW_MEMBER_WRITE", ""),
+                   help="offer member_write, in these libraries (comma list, * = any)")
     p.add_argument("--ifs-write-root", action="append",
                    default=[x for x in os.environ.get("T5250_IFS_WRITE_ROOT", "").split(
                        os.pathsep) if x],
@@ -857,7 +949,9 @@ def main(argv: list[str] | None = None) -> None:
                 ifs_write_roots=a.ifs_write_root, guard=guard,
                 allow_commands=a.allow_commands,
                 command_allow=[x for x in a.command_allow.split(",") if x.strip()],
-                compile_libs=[x for x in a.allow_compile.split(",") if x.strip()])
+                compile_libs=[x for x in a.allow_compile.split(",") if x.strip()],
+                allow_shell=a.allow_shell,
+                member_write_libs=[x for x in a.allow_member_write.split(",") if x.strip()])
             print("tn5250-mcp: SQL/IFS tools on (%s)" % a.jt400, file=sys.stderr)
         server = build_server(mgr, flowset, toolsets, a.flows_only, a.read_only, a.pace,
                               profileset, a.profiles_only, hostservers)
