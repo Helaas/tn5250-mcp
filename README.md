@@ -381,6 +381,83 @@ recording knows which screens you went through, not which parts of them
 matter. In Python: `t.record_start()` ... `t.record_stop("name", "what it
 does", save_dir="flows")`.
 
+## Test suites
+
+A suite is a YAML file of tests built from flows. `tn5250-run test` runs it
+and writes JUnit XML (for CI) and an HTML report (for people):
+
+```sh
+tn5250-run test tests/data_entry.yaml --var lib=MYLIB --profiles profiles.yaml \
+    --jt400 lib/jt400.jar --junit results.xml --html report.html
+```
+
+```yaml
+suite: data entry through UPDDTA
+profile: pub400                           # or connect: {host: ..., port: ...}
+flows: [../flows]
+vars: {lib: MYLIB}                        # {lib} anywhere below; --var lib=X overrides
+home: {text: "IBM i Main Menu", keys: [F3, Enter]}   # back here before each test
+
+setup:                                    # sql, command or flow items
+  - command: "DLTF FILE({lib}/T5250TEST)"
+    ignore_errors: true
+  - sql: CREATE TABLE {lib}/T5250TEST (...)
+
+tests:
+  - name: enter a record
+    data: records.csv                     # one test per row (columns: id, name, qty)
+    steps:
+      - {flow: start_data_entry, with: {lib: "{lib}"}}
+      - {flow: add_record, with: {id: "{id}", name: "{name}", qty: "{qty}"}}
+      - {flow: end_data_entry, with: {expect_added: 1}}
+    expect:
+      screen: ["IBM i Main Menu"]
+      snapshot: main_menu
+      sql:
+        - query: SELECT NAME, QTY FROM {lib}/T5250TEST WHERE ID = ?
+          params: ["{id}"]
+          rows: [["{name}", "{qty}"]]
+  - name: a duplicate ID is refused
+    steps: [...]
+    expect_failure: "check failed"        # a negative test: the flow must fail like this
+
+teardown:
+  - sql: DROP TABLE {lib}/T5250TEST
+```
+
+- **Tests** run a `flow` (with `with`) or several `steps`. `data:` (a CSV file)
+  or `cases:` (a list) runs a test once per row; row values are `{name}`
+  templates, and a test without `with` passes the row's matching columns to
+  the flow. `skip: reason` skips a test.
+- **Expectations** after the flows: `captured` (regex per captured value),
+  `screen` / `not_screen` (texts, or `"row:text"`), `snapshot` (see below) and
+  `sql` (a read-only `query` with `params`, then `rows` exactly, `contains`
+  some rows, or a row `count`). `expect_failure` expects a flow to fail, with
+  a message matching the regex.
+- **Recovery.** With `home`, each test starts from that screen: the runner
+  presses Reset and the `keys` until it shows up, so one failing test doesn't
+  break the next ones. Teardown goes home first too.
+- **Setup and teardown** run SQL (`sql`, `params`), CL commands (`command`) or
+  flows (`flow`, `with`); `ignore_errors: true` for things that may fail. A
+  failed setup stops the suite and is reported as an error.
+- **Snapshots** save a screen the first time (in `<suite>.snapshots/`, or
+  `snapshots:`) and compare it on later runs. Dates, times, job names and
+  device names are masked, and `ignore:` adds regexes. A difference fails the
+  test with a diff; `--update-snapshots` saves the current screens as the new
+  expected ones. In Python and pytest: `t5250.assert_snapshot("main_menu")`.
+- **Reports.** `--junit` writes JUnit XML that CI systems (GitHub Actions,
+  Jenkins, GitLab) show per test. `--html` writes a self-contained page: a
+  summary, then per test its steps, captures, the final screen and any
+  snapshot diff. The exit code is 0 when everything passed, 1 otherwise.
+  `--only REGEX` runs some tests.
+- **Signing on.** The suite uses the profile's sign-on flow: with a password in
+  the keychain (or `$T5250_PASSWORD` in CI) nothing asks. SQL and commands use
+  the same saved password, so `--jt400` is all they need.
+
+[`examples/tests/data_entry.yaml`](examples/tests/data_entry.yaml) is the
+suite above, with `records.csv`. Note: UPDDTA prints an audit list
+(`QPDZDTALOG`) per run in the interactive job.
+
 ## Scripts, CI and pytest
 
 The flows and the engine work without an MCP client.

@@ -1,0 +1,56 @@
+# Data entry through UPDDTA (DFU), checked with SQL. Uses the flows in
+# examples/flows. Run it (the library must exist; the table is created and
+# dropped again):
+#
+#   tn5250-run test examples/tests/data_entry.yaml --var lib=MYLIB \
+#       --profiles profiles.yaml --jt400 lib/jt400.jar --junit results.xml --html report.html
+
+suite: data entry through UPDDTA
+profile: pub400
+flows: [../flows]
+vars: {lib: MYLIB}
+home: {text: "IBM i Main Menu", keys: [F3, Enter]}
+
+setup:
+  - command: "DLTF FILE({lib}/T5250TEST)"
+    ignore_errors: true                    # not there yet: fine
+  - sql: >-
+      CREATE TABLE {lib}/T5250TEST (ID INT NOT NULL PRIMARY KEY,
+      NAME CHAR(20) NOT NULL, QTY DECIMAL(5,0) NOT NULL)
+
+tests:
+  - name: enter a record
+    data: records.csv                      # one test per row: id, name, qty
+    steps:
+      - flow: start_data_entry
+        with: {lib: "{lib}"}
+      - flow: add_record
+        with: {id: "{id}", name: "{name}", qty: "{qty}"}
+      - flow: end_data_entry
+        with: {expect_added: 1}
+    expect:
+      screen: ["IBM i Main Menu"]
+      snapshot: main_menu                  # saved on the first run, compared after
+      sql:
+        - query: SELECT NAME, QTY FROM {lib}/T5250TEST WHERE ID = ?
+          params: ["{id}"]
+          rows: [["{name}", "{qty}"]]
+
+  - name: a duplicate ID is refused
+    steps:
+      - flow: start_data_entry
+        with: {lib: "{lib}"}
+      - flow: add_record
+        with: {id: 1, name: AGAIN, qty: 1}
+    expect_failure: "check failed"         # DFU shows a message instead of a new record
+
+  - name: the table holds exactly what was entered
+    flow: sql_select
+    with: {statement: "SELECT ID FROM {lib}/T5250TEST"}
+    expect:
+      sql:
+        - query: SELECT ID, NAME, QTY FROM {lib}/T5250TEST ORDER BY ID
+          rows: [["1", "WIDGET", "25"], ["2", "GADGET", "100"], ["3", "SPROCKET", "-3"]]
+
+teardown:
+  - sql: DROP TABLE {lib}/T5250TEST

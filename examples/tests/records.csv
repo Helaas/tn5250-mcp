@@ -1,0 +1,4 @@
+case,id,name,qty
+widget,1,WIDGET,25
+gadget,2,GADGET,100
+sprocket (negative),3,SPROCKET,-3

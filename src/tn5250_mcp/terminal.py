@@ -37,7 +37,7 @@ class Terminal:
                  guard: Guard | None = None, viewer_port: int | None = None,
                  timeout: float = 20.0, pace: float = 0.0, reconnect_attempts: int = 0,
                  reconnect_interval: float = 5.0, jt400: str | None = None,
-                 java: str | None = None):
+                 java: str | None = None, creds=None):
         self.host, self.port, self.tls, self.verify_tls = host, port, tls, verify_tls
         self.name, self.device_name, self.wide = session, device_name, wide
         self.timeout = timeout
@@ -45,7 +45,7 @@ class Terminal:
         # the block list still applies.
         self.mgr = Manager(guard or Guard(require_check=False), log_dir=log_dir,
                            default_codepage=codepage, reconnect_attempts=reconnect_attempts,
-                           reconnect_interval=reconnect_interval)
+                           reconnect_interval=reconnect_interval, creds=creds)
         if flows is None or isinstance(flows, FlowSet):
             self.flows = flows
         else:
@@ -101,8 +101,14 @@ class Terminal:
         if not flow:
             raise TerminalError("profile %s runs flow %r after connecting; load the flows that "
                                 "define it (flows=[...])" % (p.name, p.after_connect["flow"]))
-        missing = [sp for sp in flow.secrets(self.flows)
-                   if not (sp.env and os.environ.get(sp.env))]
+        args = dict(p.after_connect["with"])
+
+        def known(sp) -> bool:
+            if sp.env and os.environ.get(sp.env):
+                return True
+            user = args.get(sp.user_param) if sp.user_param else None
+            return bool(user and self.mgr.creds.get(self.host, str(user)))  # saved already
+        missing = [sp for sp in flow.secrets(self.flows) if not known(sp)]
         if missing and wait_for_viewer and not self.mgr.viewer_watching(self.name):
             url = self.start_viewer(self._viewer_port or 0)
             announce("Open the viewer to type the password: %s" % url)
@@ -172,6 +178,17 @@ class Terminal:
         one, and the word 'password' or 'sign on' on screen. Works for custom
         sign-on screens too (PUB400's has no 'Sign On' title)."""
         return self.session.on_signon_screen()
+
+    def assert_snapshot(self, name: str, folder: str = "snapshots", ignore=(),
+                        update: bool = False) -> str:
+        """Compare the screen with a saved snapshot (dates, times, job and
+        device names masked; `ignore` adds regexes). Saves it the first time.
+        Raises AssertionError with a diff when it differs."""
+        from .testing import check_snapshot
+        status, diff = check_snapshot(self.rows, name, folder, list(ignore), update)
+        if status == "differs":
+            raise AssertionError("the screen differs from snapshot %s:\n%s" % (name, diff))
+        return status
 
     def field(self, ref: str) -> str:
         """Current text of an input field (not for hidden fields)."""

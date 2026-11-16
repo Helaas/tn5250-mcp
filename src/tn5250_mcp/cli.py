@@ -200,6 +200,71 @@ def cmd_compile(a) -> int:
     return 0 if res["ok"] else 1
 
 
+def cmd_test(a) -> int:
+    from .credentials import CredentialStore
+    from .testing import (SuiteError, SuiteRunner, html_report, junit_xml, load_flows,
+                          load_suite)
+    try:
+        suite = load_suite(a.suite, _parse_params(a.var))
+        flows = load_flows(suite)
+    except (SuiteError, FlowConfigError) as e:
+        print("invalid suite: %s" % e, file=sys.stderr)
+        return 2
+    say = lambda m: print(m, file=sys.stderr)  # noqa: E731
+    common = dict(flows=flows, log_dir=a.log_dir, viewer_port=a.viewer_port, jt400=a.jt400,
+                  java=a.java, creds=CredentialStore(keychain=True))
+    try:
+        if suite.connect.get("profile"):
+            t = Terminal.from_profile(suite.connect["profile"],
+                                      suite.connect.get("profiles") or a.profiles
+                                      or ["profiles.yaml"], **common)
+        elif suite.connect.get("host") or a.host:
+            cc = suite.connect
+            t = Terminal(cc.get("host") or a.host, int(cc.get("port", 992)),
+                         tls=bool(cc.get("tls", True)), **common)
+        else:
+            print("the suite has no profile or connect, and no --host was given",
+                  file=sys.stderr)
+            return 2
+    except ProfileError as e:
+        print("profile: %s" % e, file=sys.stderr)
+        return 2
+    print("suite %s: %d tests" % (suite.name, len(suite.cases)), file=sys.stderr)
+    try:
+        t.connect(run_after_connect=False)
+        mode = a.signon
+        if mode == "auto":
+            mode = "env" if os.environ.get("T5250_PASSWORD") else "viewer"
+        if mode != "none" and t.profile and t.profile.after_connect:
+            t.run_after_connect(wait_for_viewer=600 if mode == "viewer" else 0, announce=say)
+        elif mode != "none" and t.on_signon():
+            if mode == "env":
+                t.signon()
+            else:
+                t.signon_in_viewer(announce=say)
+    except (TerminalError, FlowError, OSError) as e:
+        print("could not get a signed-on session: %s" % e, file=sys.stderr)
+        t.close()
+        return 3
+    sr = SuiteRunner(suite, t, update_snapshots=a.update_snapshots, only=a.only,
+                     say=say).run()
+    try:
+        t.signoff()
+    except (TerminalError, OSError):
+        pass
+    t.close()
+    if a.junit:
+        open(a.junit, "w", encoding="utf-8").write(junit_xml(sr))
+    if a.html:
+        open(a.html, "w", encoding="utf-8").write(html_report(sr))
+    c = sr.counts()
+    print("%s: %d passed, %d failed, %d errors, %d skipped (%.1fs)%s" % (
+        "PASSED" if sr.ok else "FAILED", c["passed"], c["failed"], c["error"], c["skipped"],
+        sr.seconds, "; setup failed: " + sr.setup_error if sr.setup_error else ""),
+        file=sys.stderr)
+    return 0 if sr.ok else 1
+
+
 def _host_args(x) -> None:
     x.add_argument("--profile", default=os.environ.get("T5250_PROFILE"))
     x.add_argument("--profiles", action="append",
@@ -218,6 +283,24 @@ def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser(prog="tn5250-run", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
+
+    tt = sub.add_parser("test", help="run a test suite (YAML) and write reports")
+    tt.add_argument("suite")
+    tt.add_argument("--var", action="append", default=[], metavar="name=value",
+                    help="override a suite variable (repeatable)")
+    tt.add_argument("--junit", help="write JUnit XML here (for CI)")
+    tt.add_argument("--html", help="write an HTML report here")
+    tt.add_argument("--update-snapshots", action="store_true",
+                    help="save the current screens as the expected snapshots")
+    tt.add_argument("--only", help="run only tests whose name matches this regex")
+    tt.add_argument("--signon", choices=["auto", "env", "viewer", "none"], default="auto")
+    tt.add_argument("--viewer-port", type=int, default=None)
+    tt.add_argument("--profiles", action="append", default=[])
+    tt.add_argument("--host", default=os.environ.get("T5250_HOST"))
+    tt.add_argument("--jt400", default=os.environ.get("T5250_JT400"))
+    tt.add_argument("--java", default=os.environ.get("T5250_JAVA"))
+    tt.add_argument("--log-dir", default=os.environ.get("T5250_LOG_DIR"))
+    tt.set_defaults(fn=cmd_test)
 
     k = sub.add_parser("cmd", help="run a CL command through the host servers")
     k.add_argument("command")

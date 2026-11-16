@@ -40,6 +40,11 @@ flows:
       - expect: "IBM i Main Menu"
         fill: {"Selection or command": "UPDDTA FILE({lib}/T5250TEST)"}
         press: Enter
+        check: {text: "1:WORK WITH DATA IN A FILE"}
+      - name: switch to entry mode           # DFU opens in CHANGE mode once the file has records
+        when: "1:CHANGE"
+        press: F10
+      - name: in entry mode
         check: {text: "1:ENTRY"}
 
   add_record:

@@ -159,3 +159,33 @@ def test_example_profiles_are_valid():
     fs = FlowSet.load(["examples/flows"])
     ps.validate_flows(fs, FlowRunner(Manager(Guard()), fs))
     assert set(ps.profiles) == {"pub400", "dev"}
+
+
+
+def test_after_connect_uses_a_saved_password(monkeypatch, tmp_path):
+    """A saved password (memory or keychain) means nobody has to open the viewer."""
+    Net(monkeypatch)
+    monkeypatch.delenv("DEMO_PW", raising=False)
+    f = tmp_path / "profiles.yaml"
+    f.write_text(DEMO)
+    flows = flowset(SIGNON_SAVED)
+    t = Terminal.from_profile("demo", str(f), flows=flows)
+    t.mgr.creds.put("demo.example.com", "BOB", "pw-1")
+    t.connect(run_after_connect=False)
+    asked = []
+    t.run_after_connect(wait_for_viewer=5, announce=asked.append)
+    assert asked == [] and t.on("Demo Main Menu")
+    t.close()
+
+
+SIGNON_SAVED = """
+flows:
+  signon:
+    description: sign on
+    params:
+      user: {type: string, upper: true}
+      password: {type: secret, env: DEMO_PW, user_param: user}
+    steps:
+      - {expect: "Welcome", fill: {user: "{user}", Password: "{password}"}, press: Enter,
+         check: {text: "Demo Main Menu"}}
+"""
