@@ -203,6 +203,33 @@ def check_libl(libl) -> list[str]:
     return out
 
 
+PARAM_TYPE = re.compile(r"^(char|varchar)\((\d+)\)$|^(packed|zoned)\((\d+),(\d+)\)$|"
+                        r"^int\((5|10|20)\)$|^uns\((5|10)\)$|^float\((4|8)\)$|^ind$")
+
+
+def check_param(p, i: int = 1) -> dict:
+    """A program parameter: {type, value, out}. Types as in RPG: char(n),
+    varchar(n), packed(d,p), zoned(d,p), int(5|10|20), uns(5|10), float(4|8), ind."""
+    if not isinstance(p, dict) or "type" not in p or set(p) - {"type", "value", "out"}:
+        raise HostServerError("parameter %d: {type, value, out} (got %r)" % (i, p))
+    t = str(p["type"]).strip().lower().replace(" ", "")
+    m = PARAM_TYPE.match(t)
+    if not m:
+        raise HostServerError("parameter %d: type is char(n), varchar(n), packed(d,p), "
+                              "zoned(d,p), int(5|10|20), uns(5|10), float(4|8) or ind (got %r)"
+                              % (i, p["type"]))
+    if (m.group(2) and not 1 <= int(m.group(2)) <= 32000) or (
+            m.group(4) and not (1 <= int(m.group(4)) <= 63 and int(m.group(5)) <= int(m.group(4)))):
+        raise HostServerError("parameter %d: size out of range in %r" % (i, p["type"]))
+    v = p.get("value")
+    if v is not None and m.group(3) or v is not None and t.startswith(("int", "uns", "float")):
+        try:
+            float(str(v))
+        except ValueError:
+            raise HostServerError("parameter %d: %r is not a number" % (i, v)) from None
+    return {"type": t, "value": v, "out": bool(p.get("out"))}
+
+
 def command_name(cmd: str) -> str:
     """CRTBNDRPG for 'QSYS/CRTBNDRPG PGM(...)'."""
     first = cmd.strip().split(None, 1)[0].upper() if cmd.strip() else ""
@@ -404,15 +431,50 @@ class HostServers:
             "ok" if res.get("ok") else "FAILED", len(res.get("messages", [])), worst))
         return res
 
+    def call_program(self, name: str, program: str, params: list[dict] | None = None,
+                     libl: list[str] | None = None) -> dict:
+        """CALL a program with typed parameters (in the command job, with its
+        library list) and return the output parameters. Needs --allow-commands
+        (and CALL among --command-allow, if that is set)."""
+        self._need(name)
+        if not self.allow_commands:
+            raise HostServerError("calling programs is off on this server (start it with "
+                                  "--allow-commands)")
+        if self.command_allow and not any(fnmatch.fnmatch("CALL", p) for p in self.command_allow):
+            raise HostServerError("CALL is not among the commands this server allows")
+        prog = program.strip().upper()
+        if not re.fullmatch(r"(?:[A-Z$#@][A-Z0-9_$#@.]{0,9}/)?[A-Z$#@][A-Z0-9_$#@.]{0,9}", prog):
+            raise HostServerError("program is NAME or LIB/NAME (got %r)" % program)
+        self._guard_command("CALL PGM(%s)" % prog)
+        plist = [check_param(p, i) for i, p in enumerate(params or [], 1)]
+        if libl:
+            libl = check_libl(libl)
+        res = self.helper.call("call_program", name=name, program=prog, params=plist,
+                               **({"libl": libl} if libl else {}))
+        self.conns[name]["_cmdjob"] = res.get("job")
+        self.log(name, "call", "%s with %d parameters -> %s" % (
+            prog, len(plist), "ok" if res.get("ok") else "FAILED"))
+        return res
+
+    def ifs_mkdir(self, name: str, path: str) -> bool:
+        """Create a directory (and its parents) for uploads; same rules as writes."""
+        self._need(name)
+        p = norm_ifs_path(path)
+        if not any(under(p, r) for r in self.ifs_write_roots):
+            raise HostServerError("%s is outside the folders this server may write to: %s"
+                                  % (p, ", ".join(self.ifs_write_roots) or "none"))
+        return bool(self.helper.call("ifs_mkdir", name=name, path=p))
+
     def compile(self, name: str, source: str, obj: str, kind: str | None = None,
-                options: str = "", libl: list[str] | None = None) -> dict:
+                options: str = "", libl: list[str] | None = None,
+                listing: bool = True) -> dict:
         """Compile a source (IFS path or LIB/FILE(MBR)) into LIB/NAME and read
         the compiler's event file. Needs --allow-compile with that library."""
         from .compiler import CompileError, build_command, parse_events, split_object
         self._need(name)
         try:
             lib, objname = split_object(obj)
-            cmd = build_command(source, obj, kind, options)
+            cmd = build_command(source, obj, kind, options, listing)
         except CompileError as e:
             raise HostServerError(str(e)) from None
         if not self.compile_libs:

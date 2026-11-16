@@ -200,6 +200,70 @@ def cmd_compile(a) -> int:
     return 0 if res["ok"] else 1
 
 
+def parse_call_params(items: list[str]) -> list[dict]:
+    """'char(10)=BOB', 'packed(7,2)=0:out', 'char(50):out' -> parameter specs."""
+    out = []
+    for it in items:
+        spec, _, val = it.partition("=")
+        is_out = False
+        if val.endswith(":out"):
+            val, is_out = val[:-4], True
+        elif not val and spec.endswith(":out"):
+            spec, is_out = spec[:-4], True
+        p = {"type": spec, "out": is_out}
+        if "=" in it:
+            p["value"] = val
+        out.append(p)
+    return out
+
+
+def cmd_call(a) -> int:
+    from .hostservers import HostServerError
+    params = parse_call_params(a.params)
+    try:
+        hs = _host(a, allow_commands=True)
+        res = hs.call_program("cli", a.program, params)
+    except HostServerError as e:
+        print("FAILED %s" % e, file=sys.stderr)
+        return 3
+    if a.json:
+        print(json.dumps(res))
+    else:
+        for i, (p, v) in enumerate(zip(params, res.get("outputs") or []), 1):
+            if p["out"]:
+                print("%d %s = %s" % (i, p["type"], json.dumps(v)))
+        for m in res.get("messages", []):
+            print("%s (severity %s) %s" % (m.get("id") or "-", m.get("severity"), m.get("text")),
+                  file=sys.stderr)
+        print("%s (job %s)" % ("ok" if res["ok"] else "FAILED", res.get("job")), file=sys.stderr)
+    hs.close()
+    return 0 if res["ok"] else 1
+
+
+def cmd_build(a) -> int:
+    from .build import BuildError, build, load_project, report_text
+    from .hostservers import HostServerError
+    try:
+        proj = load_project(a.folder)
+    except BuildError as e:
+        print("FAILED %s" % e, file=sys.stderr)
+        return 3
+    a.profile = a.profile or proj.profile
+    a.libl = a.libl or ",".join(proj.libl)
+    try:
+        hs = _host(a, compile_libs=[proj.lib], ifs_write_roots=[proj.ifs],
+                   allow_sql_write=True)
+        res = build(hs, "cli", proj, a.all, a.only or None,
+                    say=(lambda m: None) if a.json else
+                    (lambda m: print(m, file=sys.stderr, flush=True)))
+    except (HostServerError, BuildError) as e:
+        print("FAILED %s" % e, file=sys.stderr)
+        return 3
+    print(json.dumps(res) if a.json else report_text(res))
+    hs.close()
+    return 0 if res["ok"] else 1
+
+
 def cmd_test(a) -> int:
     from .credentials import CredentialStore
     from .testing import (SuiteError, SuiteRunner, html_report, junit_xml, load_flows,
@@ -314,6 +378,21 @@ def main(argv: list[str] | None = None) -> None:
     m.add_argument("--options", help="extra compile parameters")
     _host_args(m)
     m.set_defaults(fn=cmd_compile)
+
+    b = sub.add_parser("build", help="upload a project folder and build what changed")
+    b.add_argument("folder", nargs="?", default=".",
+                   help="folder with tn5250-project.yaml (default: here)")
+    b.add_argument("--all", action="store_true", help="upload and build everything")
+    b.add_argument("--only", action="append", metavar="OBJECT", help="build just this object")
+    _host_args(b)
+    b.set_defaults(fn=cmd_build)
+
+    q = sub.add_parser("call", help="call a program with typed parameters")
+    q.add_argument("program", help="NAME or LIB/NAME")
+    q.add_argument("params", nargs="*", metavar="type[=value][:out]",
+                   help="e.g. char(10)=BOB packed(7,2):out")
+    _host_args(q)
+    q.set_defaults(fn=cmd_call)
 
     c = sub.add_parser("check", help="validate flow files and list the flows")
     c.add_argument("paths", nargs="*", help="YAML files or folders (default $T5250_FLOWS)")

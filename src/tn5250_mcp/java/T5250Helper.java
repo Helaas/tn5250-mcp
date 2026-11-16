@@ -11,6 +11,19 @@
 // requests and are never written anywhere.
 
 import com.ibm.as400.access.AS400;
+import com.ibm.as400.access.AS400Bin2;
+import com.ibm.as400.access.AS400Bin4;
+import com.ibm.as400.access.AS400Bin8;
+import com.ibm.as400.access.AS400DataType;
+import com.ibm.as400.access.AS400Float4;
+import com.ibm.as400.access.AS400Float8;
+import com.ibm.as400.access.AS400PackedDecimal;
+import com.ibm.as400.access.AS400UnsignedBin2;
+import com.ibm.as400.access.AS400UnsignedBin4;
+import com.ibm.as400.access.AS400ZonedDecimal;
+import com.ibm.as400.access.ProgramCall;
+import com.ibm.as400.access.ProgramParameter;
+import com.ibm.as400.access.QSYSObjectPathName;
 import com.ibm.as400.access.AS400JDBCDriver;
 import com.ibm.as400.access.AS400Message;
 import com.ibm.as400.access.AS400Exception;
@@ -111,6 +124,13 @@ public class T5250Helper {
             case "connect": return connect(r);
             case "change_password": return changePassword(r);
             case "command": return command(r);
+            case "call_program": return callProgram(r);
+            case "ifs_mkdir": {
+                IFSFile d = ifs(r);
+                boolean made = !d.exists() && d.mkdirs();
+                if (!d.exists()) throw new IllegalArgumentException("could not create " + d.getPath());
+                return made;
+            }
             case "read_member": return readMember(r);
             case "spooled_file": return spooledFile(r);
             case "close": {
@@ -253,24 +273,139 @@ public class T5250Helper {
             c.cmd = new CommandCall(c.system);
             c.cmd.setThreadSafe(false);       // always the same server job: libl stays set
         }
+        Map<String, Object> res = new LinkedHashMap<>();
+        if (!setLibl(c, r, res)) return res;
+        boolean ok = c.cmd.run(str(r, "command"));
+        res.put("ok", ok);
+        res.put("messages", messages(c.cmd.getMessageList()));
+        res.put("job", jobName(c.cmd.getServerJob()));
+        res.put("libl", c.cmdLibl);
+        return res;
+    }
+
+    /** Set the library list in the command job when asked for (or the
+     *  connection's). false (and res filled in) when CHGLIBL failed. */
+    static boolean setLibl(Conn c, Map<String, Object> r, Map<String, Object> res) throws Exception {
+        if (c.cmd == null) {
+            c.cmd = new CommandCall(c.system);
+            c.cmd.setThreadSafe(false);       // always the same server job: libl stays set
+        }
         List<String> want = strings(r.get("libl"));
         if (want == null) want = c.libl;
-        Map<String, Object> res = new LinkedHashMap<>();
         if (want != null && !want.isEmpty() && !want.equals(c.cmdLibl)) {
             if (!c.cmd.run("CHGLIBL LIBL(" + String.join(" ", want) + ")")) {
                 res.put("ok", false);
                 res.put("messages", messages(c.cmd.getMessageList()));
                 res.put("step", "CHGLIBL");
                 res.put("job", jobName(c.cmd.getServerJob()));
-                return res;
+                return false;
             }
             c.cmdLibl = want;
         }
-        boolean ok = c.cmd.run(str(r, "command"));
+        return true;
+    }
+
+    /** One parameter type: char(n), varchar(n), packed(d,p), zoned(d,p),
+     *  int(5|10|20), uns(5|10), float(4|8), ind. */
+    static final class PType {
+        AS400DataType dt;
+        int length;
+        boolean varchar, ind;
+    }
+
+    static PType ptype(String spec, AS400 sys) {
+        java.util.regex.Matcher m = java.util.regex.Pattern
+            .compile("(char|varchar|packed|zoned|int|uns|float|ind)(?:\\((\\d+)(?:,(\\d+))?\\))?")
+            .matcher(spec.trim().toLowerCase());
+        if (!m.matches()) throw new IllegalArgumentException("unknown parameter type " + spec);
+        String k = m.group(1);
+        int a = m.group(2) == null ? -1 : Integer.parseInt(m.group(2));
+        int b = m.group(3) == null ? 0 : Integer.parseInt(m.group(3));
+        PType t = new PType();
+        switch (k) {
+            case "char": t.dt = new com.ibm.as400.access.AS400Text(a, sys); break;
+            case "ind": t.dt = new com.ibm.as400.access.AS400Text(1, sys); t.ind = true; break;
+            case "varchar": t.dt = new com.ibm.as400.access.AS400Text(a, sys); t.varchar = true; break;
+            case "packed": t.dt = new AS400PackedDecimal(a, b); break;
+            case "zoned": t.dt = new AS400ZonedDecimal(a, b); break;
+            case "int": t.dt = a == 5 ? new AS400Bin2() : a == 20 ? new AS400Bin8() : new AS400Bin4(); break;
+            case "uns": t.dt = a == 5 ? new AS400UnsignedBin2() : new AS400UnsignedBin4(); break;
+            case "float": t.dt = a == 4 ? new AS400Float4() : new AS400Float8(); break;
+            default: throw new IllegalArgumentException("unknown parameter type " + spec);
+        }
+        t.length = t.dt.getByteLength() + (t.varchar ? 2 : 0);
+        return t;
+    }
+
+    static byte[] toBytes(PType t, Object v) {
+        if (t.varchar) {
+            String s = v == null ? "" : String.valueOf(v);
+            byte[] text = t.dt.toBytes(s);
+            int n = Math.min(s.length(), t.dt.getByteLength());
+            byte[] out = new byte[t.length];
+            out[0] = (byte) (n >> 8);
+            out[1] = (byte) n;
+            System.arraycopy(text, 0, out, 2, text.length);
+            return out;
+        }
+        if (t.ind) return t.dt.toBytes(Boolean.TRUE.equals(v) || "1".equals(String.valueOf(v)) ? "1" : "0");
+        if (t.dt instanceof com.ibm.as400.access.AS400Text) return t.dt.toBytes(v == null ? "" : String.valueOf(v));
+        String s = v == null ? "0" : String.valueOf(v).trim();
+        if (t.dt instanceof AS400PackedDecimal || t.dt instanceof AS400ZonedDecimal)
+            return t.dt.toBytes(new BigDecimal(s));
+        if (t.dt instanceof AS400Bin2) return t.dt.toBytes(Short.valueOf(s));
+        if (t.dt instanceof AS400Bin4) return t.dt.toBytes(Integer.valueOf(s));
+        if (t.dt instanceof AS400Bin8) return t.dt.toBytes(Long.valueOf(s));
+        if (t.dt instanceof AS400UnsignedBin2) return t.dt.toBytes(Integer.valueOf(s));
+        if (t.dt instanceof AS400UnsignedBin4) return t.dt.toBytes(Long.valueOf(s));
+        if (t.dt instanceof AS400Float4) return t.dt.toBytes(Float.valueOf(s));
+        return t.dt.toBytes(Double.valueOf(s));
+    }
+
+    static String fromBytes(PType t, byte[] b) {
+        if (t.varchar) {
+            int n = ((b[0] & 0xFF) << 8) | (b[1] & 0xFF);
+            byte[] text = Arrays.copyOfRange(b, 2, 2 + Math.min(n, b.length - 2));
+            return (String) new com.ibm.as400.access.AS400Text(text.length,
+                ((com.ibm.as400.access.AS400Text) t.dt).getCcsid()).toObject(text);
+        }
+        Object o = t.dt.toObject(b);
+        if (o instanceof BigDecimal) return ((BigDecimal) o).toPlainString();
+        return rtrim(String.valueOf(o));
+    }
+
+    /** CALL a program with typed parameters in the command job (same library
+     *  list as run_command); returns the output parameters as text. */
+    static Object callProgram(Map<String, Object> r) throws Exception {
+        Conn c = conn(r);
+        Map<String, Object> res = new LinkedHashMap<>();
+        if (!setLibl(c, r, res)) return res;
+        String prog = str(r, "program").toUpperCase();
+        String lib = "*LIBL", name = prog;
+        if (prog.contains("/")) { lib = prog.substring(0, prog.indexOf('/')); name = prog.substring(prog.indexOf('/') + 1); }
+        List<?> spec = r.get("params") instanceof List ? (List<?>) r.get("params") : new ArrayList<>();
+        PType[] types = new PType[spec.size()];
+        ProgramParameter[] pp = new ProgramParameter[spec.size()];
+        for (int i = 0; i < spec.size(); i++) {
+            @SuppressWarnings("unchecked")
+            Map<String, Object> p = (Map<String, Object>) spec.get(i);
+            types[i] = ptype(str(p, "type"), c.system);
+            byte[] in = toBytes(types[i], p.get("value"));
+            pp[i] = Boolean.TRUE.equals(p.get("out")) ? new ProgramParameter(in, types[i].length)
+                                                     : new ProgramParameter(in);
+        }
+        ProgramCall pc = new ProgramCall(c.system);
+        pc.setThreadSafe(false);              // the command job: its library list
+        boolean ok = pc.run(new QSYSObjectPathName(lib, name, "PGM").getPath(), pp);
+        List<Object> outs = new ArrayList<>();
+        for (int i = 0; i < pp.length; i++) {
+            byte[] o = pp[i].getOutputData();
+            outs.add(ok && o != null ? fromBytes(types[i], o) : null);
+        }
         res.put("ok", ok);
-        res.put("messages", messages(c.cmd.getMessageList()));
+        res.put("outputs", outs);
+        res.put("messages", messages(pc.getMessageList()));
         res.put("job", jobName(c.cmd.getServerJob()));
-        res.put("libl", c.cmdLibl);
         return res;
     }
 

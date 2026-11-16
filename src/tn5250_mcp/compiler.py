@@ -77,13 +77,18 @@ def kind_for(source: str, kind: str | None) -> str:
                        % (source, ", ".join(KINDS)))
 
 
-def build_command(source: str, obj: str, kind: str | None = None, options: str = "") -> str:
+def build_command(source: str, obj: str, kind: str | None = None, options: str = "",
+                  listing: bool = True) -> str:
+    """listing=False: no compile listing (spooled file) unless there are errors;
+    the event file has the errors either way."""
     k = kind_for(source, kind)
     cmd, kw, extra, dbg = KINDS[k]
     lib, name = split_object(obj)
     if options and re.search(r"\bOPTION\s*\(", options, re.I):
         raise CompileError("options may not set OPTION: *EVENTF is needed for the errors")
-    parts = [cmd, "%s(%s/%s)" % (kw, lib, name), source_clause(source), "OPTION(*EVENTF)"]
+    dds = cmd in ("CRTDSPF", "CRTPRTF", "CRTPF", "CRTLF")
+    parts = [cmd, "%s(%s/%s)" % (kw, lib, name), source_clause(source),
+             "OPTION(*EVENTF *NOSRC *NOLIST)" if dds and not listing else "OPTION(*EVENTF)"]
     if extra:
         parts.append(extra)
     # stream files are usually UTF-8 (1208), which RPG can't compile with its default
@@ -96,6 +101,8 @@ def build_command(source: str, obj: str, kind: str | None = None, options: str =
             parts.append("CVTCCSID(*JOB)")
     if dbg and not re.search(r"\bDBGVIEW\s*\(", options or "", re.I):
         parts.append("DBGVIEW(*SOURCE)")
+    if not dds and not listing and not re.search(r"\bOUTPUT\s*\(", options or "", re.I):
+        parts.append("OUTPUT(*NONE)")
     if options:
         parts.append(options.strip())
     return " ".join(parts)

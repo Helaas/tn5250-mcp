@@ -89,6 +89,8 @@ claude mcp add --transport http tn5250 http://127.0.0.1:8250/mcp
 | `ifs_write` | write stream files (only inside `--ifs-write-root` folders) |
 | `run_command` | run a CL command with a library list, get IBM i's messages (only with `--allow-commands`) |
 | `compile` | compile a source and get its errors as file:line:column (only into `--allow-compile` libraries) |
+| `call_program` | call a program with typed parameters, get the output parameters back (only with `--allow-commands`) |
+| `build_project` | upload a local project folder and build what changed, errors as local file:line:column |
 | `job_log` | a job's messages: why a command, compile or batch job failed |
 | `spooled_files`, `spooled_file` | list and read printed output: reports, listings, job logs |
 | `list_sessions`, `keys` | housekeeping |
@@ -199,6 +201,107 @@ job_log    {}                                        # the full story if somethi
   `--host/--user`. The password comes from the keychain, `$T5250_PASSWORD`, or
   a prompt. They exit 0 on success and 1 on failure, and print errors as
   `file:line:column: ...`, which editors and CI understand.
+
+### Calling programs
+
+`call_program` calls a program with real, typed parameters, the way another
+program would, and returns the output parameters. No screen, no `CALL PARM()`
+string building, no guessing how CL passes numbers. That makes it the tool for
+unit-testing programs (and service procedures, through a small wrapper
+program).
+
+```text
+call_program {"program": "MYLIB/CALC", "params": [
+  {"type": "char(10)", "value": "Ada"},
+  {"type": "packed(7,2)", "value": 12.25},
+  {"type": "packed(7,2)", "value": 0.5},
+  {"type": "packed(9,2)", "out": true},
+  {"type": "char(20)", "out": true}]}
+→ ok: CALL MYLIB/CALC
+    parameter 4 packed(9,2) = "12.75"
+    parameter 5 char(20) = "Hello Ada"
+```
+
+Types are written as in RPG: `char(n)`, `varchar(n)`, `packed(d,p)`,
+`zoned(d,p)`, `int(5|10|20)`, `uns(5|10)`, `float(4|8)`, `ind`. Decimal values
+come back as strings so no digits are lost. The call runs in the same job as
+`run_command`, with its library list (`libl` sets one), and needs
+`--allow-commands` (and `CALL` among `--command-allow` if you set that).
+`QCMDEXC` and `QCAPCMD` are on the block list, so a call can't run commands
+around it. From a shell: `tn5250-run call MYLIB/CALC "char(10)=Ada"
+"packed(7,2)=12.25" "packed(7,2)=0.5" "packed(9,2):out" "char(20):out"`.
+
+## Building a project
+
+`build_project` (and `tn5250-run build`) builds a whole project from a local
+folder, so an agent can work in files on your machine, with git, and build on
+IBM i. It uploads the sources that changed to the project's IFS folder,
+creates what needs creating, in order, and returns errors as **local**
+`file:line:column`, ready to fix.
+
+```yaml
+# tn5250-project.yaml
+project: hello
+lib: MYLIB                   # objects are created here
+libl: [MYLIB, QGPL]          # library list while building (default: [lib])
+ifs: /home/ME/hello          # the folder is mirrored here
+src: src                     # where the sources are (default: the project folder)
+bnddir: HELLO                # optional: gets the service programs; programs bind to it
+srvpgms:
+  GREET: {modules: [GREET], bnd: greet.bnd}     # or leave out bnd for EXPORT(*ALL)
+programs:
+  MAIN: {modules: [MAIN], srvpgms: [GREET]}
+options: {rpgmod: "TGTRLS(*CURRENT)"}           # extra parameters per type
+```
+
+The file names say what to create (see [examples/project](examples/project)):
+
+| file | becomes |
+|---|---|
+| `name.pgm.rpgle`, `.pgm.sqlrpgle`, `.pgm.clle` | program NAME from one source (`CRTBNDRPG`, `CRTSQLRPGI`, `CRTBNDCL`) |
+| `name.rpgle`, `.sqlrpgle`, `.clle` | module NAME, for `srvpgms` and `programs` |
+| `name.pf`, `.lf`, `.dspf`, `.prtf` | file NAME from DDS |
+| `name.sql`, `.table`, `.view`, `.index`, `.sqlprc`, `.sqludf`, `.sqltrg` | `RUNSQLSTM` (needs `--allow-sql-write`; write `CREATE OR REPLACE`) |
+| `name.bnd` | binder source for a service program |
+| `name.rpgleinc`, `.rpginc`, `.inc`, `.cpy`, `.clinc` | include: uploaded, no object |
+
+- **Order:** SQL, physical files, logical files, display and printer files,
+  modules, service programs, programs. If something fails, what needs it is
+  skipped with a reason, and the rest still builds.
+- **Incremental:** a local `.tn5250-build.json` keeps hashes of what was
+  uploaded and built (put it in `.gitignore`). A rebuild covers what changed
+  plus what depends on it: sources that `/copy` or `/include` a changed
+  include, programs and service programs over changed modules, sources that
+  declare a changed file (`dcl-f`, F specs, `PFILE`). `rebuild_all` (`--all`)
+  does everything; `only` (`--only NAME`) builds just those objects.
+- **Includes:** RPG compiles get `INCDIR('<ifs folder>')`, so
+  `/copy inc/greet_h.rpgleinc` works as it does locally.
+- **DDS:** `CRTPF`, `CRTLF`, `CRTDSPF` and `CRTPRTF` don't read stream files
+  (CPD0043 on IBM i 7.5), so the build copies the source into a member in
+  `QTEMP` first; errors still point at your local file. `CRTPF` and `CRTLF`
+  can't replace a file, so a changed physical or logical file is deleted
+  (logical files first) and created again: **its data is lost**, as it would
+  be for a build in a development library.
+- **Programs and binding directories:** with `bnddir`, programs from one
+  source get `BNDDIR(...)` and `DFTACTGRP(*NO)`, since the command's default
+  `DFTACTGRP(*YES)` refuses a binding directory before the source's `ctl-opt`
+  is read (RNF9302).
+- **Listings:** builds use `OUTPUT(*NONE)` and `*NOLIST`, so they don't leave
+  a spooled file per compile; the event file has the errors. `RUNSQLSTM`
+  writes a listing only on errors; the build reads it for line and column and
+  deletes it.
+- **Limits:** the project's `lib` must be among `--allow-compile`, and its
+  `ifs` folder inside an `--ifs-write-root`. The CLI allows exactly the
+  project's library and folder.
+
+```text
+$ tn5250-run build examples/project --profile pub400
+FAILED  MYLIB/MAIN (rpgmod)
+  /work/hello/src/main.rpgle:9:19: severe 30 RNF7030 The name or indicator NME is not defined.
+BUILT   MYLIB/GREET (srvpgm)
+SKIPPED MYLIB/MAIN (pgm): needs MAIN, which failed
+hello: FAILED
+```
 
 ## Connection profiles
 
@@ -664,9 +767,9 @@ listens on 127.0.0.1 and needs the random token, and it checks the Host header.
 | `--java PATH` | `T5250_JAVA` | found automatically (Java 11+) |
 | `--allow-sql-write` | `T5250_ALLOW_SQL_WRITE=1` | off |
 | `--ifs-write-root DIR` (repeatable) | `T5250_IFS_WRITE_ROOT` (`:`-separated) | no `ifs_write` |
-| `--allow-commands` | `T5250_ALLOW_COMMANDS=1` | no `run_command` |
+| `--allow-commands` | `T5250_ALLOW_COMMANDS=1` | no `run_command`, `call_program` |
 | `--command-allow "DSP*,CALL"` | `T5250_COMMAND_ALLOW` | any command (block list still applies) |
-| `--allow-compile LIB[,LIB]` | `T5250_ALLOW_COMPILE` | no `compile`; `*` = any library |
+| `--allow-compile LIB[,LIB]` | `T5250_ALLOW_COMPILE` | no `compile`, `build_project` (which also needs `--ifs-write-root`); `*` = any library |
 
 ## Examples and tests
 

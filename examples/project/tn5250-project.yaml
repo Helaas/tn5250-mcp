@@ -1,0 +1,12 @@
+# A small IBM i project: tn5250-run build examples/project --profile NAME
+# (or the build_project tool). Change lib and ifs to your own library and folder.
+project: hello
+lib: MYLIB
+libl: [MYLIB, QGPL]
+ifs: /home/ME/hello
+src: src
+bnddir: HELLO
+srvpgms:
+  GREET: {modules: [GREET], bnd: greet.bnd}
+programs:
+  MAIN: {modules: [MAIN], srvpgms: [GREET]}

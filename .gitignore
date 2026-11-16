@@ -9,3 +9,4 @@ logs/
 *.jar
 !src/tn5250_mcp/java/t5250-helper.jar
 .DS_Store
+.tn5250-build.json

@@ -1,0 +1,4 @@
+**free
+dcl-pr greet varchar(50);
+  name varchar(20) const;
+end-pr;

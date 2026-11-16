@@ -60,12 +60,18 @@ BUILTIN_TOOLS = {"connect", "disconnect", "list_sessions", "get_screen", "fill",
                  "wait", "viewer", "keys", "record_start", "record_stop", "list_profiles",
                  "get_session_log", "host_connect", "host_disconnect", "sql_query",
                  "sql_execute", "ifs_list", "ifs_read", "ifs_write", "forget_password",
-                 "run_command", "compile", "job_log", "spooled_files", "spooled_file"}
+                 "run_command", "compile", "job_log", "spooled_files", "spooled_file",
+                 "call_program", "build_project"}
 
 Session_ = Annotated[str, Field(description="session name; lets you run several side by side")]
 Conn_ = Annotated[str, Field(description="name of the host-server connection")]
 Params_ = Annotated[list[str | int | float | None] | None, Field(
     description="values for ? parameter markers, in order")]
+ProgParams_ = Annotated[list[dict[str, Any]] | None, Field(
+    description="the program's parameters in order, each {type, value, out}: type as in "
+                "RPG - char(n), varchar(n), packed(d,p), zoned(d,p), int(5|10|20), "
+                "uns(5|10), float(4|8), ind; out: true to get its value back after the "
+                "call (value is then the input, or left out)")]
 
 
 def _flow_annotation(p) -> Any:
@@ -495,6 +501,63 @@ def _add_host_tools(mcp: MCPServer, mgr: Manager, hs: HostServers, profiles: Pro
                 "ok" if res["ok"] else "FAILED", command,
                 " [libl %s]" % " ".join(res["libl"]) if res.get("libl") else "",
                 messages_text(res.get("messages", [])) or "\n  (no messages)", res.get("job"))
+
+    if hs.allow_commands and not read_only:
+        @mcp.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=True,
+                                              open_world_hint=True))
+        async def call_program(
+            program: Annotated[str, Field(description="NAME (found through the library "
+                                                      "list) or LIB/NAME")],
+            params: ProgParams_ = None,
+            libl: Annotated[list[str] | None, Field(
+                description="library list to set first (kept for later calls)")] = None,
+            name: Conn_ = "main",
+        ) -> str:
+            """Call a program with typed parameters through the host servers (not the
+            screen) and return its output parameters and messages. For unit-testing
+            programs and service-program wrappers: no screen, no CL string building.
+            The program must not show screens."""
+            res = await run(hs.call_program, name, program, params, libl)
+            lines = ["%s: CALL %s" % ("ok" if res["ok"] else "FAILED", program.upper())]
+            for i, (p, v) in enumerate(zip(params or [], res.get("outputs") or []), 1):
+                if p.get("out"):
+                    lines.append("  parameter %d %s = %s" % (i, p.get("type"), json.dumps(v)))
+            msgs = res.get("messages", [])
+            if msgs:
+                lines.append("messages:" + messages_text(msgs))
+            lines.append("job %s" % res.get("job"))
+            return "\n".join(lines)
+
+    if hs.compile_libs and hs.ifs_write_roots and not read_only:
+        @mcp.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=True,
+                                              open_world_hint=True))
+        async def build_project(
+            folder: Annotated[str, Field(description="local project folder, with "
+                                                     "tn5250-project.yaml")],
+            rebuild_all: Annotated[bool, Field(description="upload and build everything, "
+                                                           "not just what changed")] = False,
+            only: Annotated[list[str] | None, Field(
+                description="build just these objects (and nothing that depends on them)")]
+            = None,
+            format: Annotated[str, Field(description="text or json")] = "text",
+            name: Conn_ = "main",
+        ) -> str:
+            """Build an IBM i project from a local folder: upload the sources that
+            changed to the project's IFS folder, then create the objects that need it
+            (SQL, files, modules, service programs, programs, in that order). Errors
+            come back as local file:line:column, so you can fix the file and build
+            again. The folder's tn5250-project.yaml says the library and IFS folder;
+            see the README for the file names (hello.pgm.rpgle, utils.rpgle, ...)."""
+            from .build import BuildError, build, load_project, report_text
+
+            def go():
+                try:
+                    return build(hs, name, load_project(folder), rebuild_all, only)
+                except BuildError as e:
+                    raise HostServerError(str(e)) from None
+            res = await run(go)
+            return (json.dumps(res, ensure_ascii=False) if format == "json"
+                    else report_text(res))
 
     if hs.compile_libs and not read_only:
         async def compile(

@@ -11,6 +11,8 @@ conns = {}
 PASSWORDS = {}
 LIBL = []
 EVF = {}
+MEMBERS = {}
+SPOOL = []
 JOBPOLL = [0]
 EXPIRED = set(os.environ.get("FAKE_EXPIRED", "").split(",")) - {""}
 
@@ -59,10 +61,20 @@ def handle(r):
         if r.get("libl"):
             LIBL[:] = r["libl"]
         res = {"job": "654321/QUSER/QZRCSRVS", "libl": list(LIBL) or None}
-        if cmd.startswith(("CRTBNDRPG", "CRTSQLRPGI", "CRTBNDCL")):
-            m = __import__("re").search(r"(PGM|OBJ)\((\w+)/(\w+)\) SRCSTMF\('([^']+)'\)", cmd)
+        if os.environ.get("FAKE_CMDLOG"):
+            with open(os.environ["FAKE_CMDLOG"], "a") as fh:
+                fh.write(cmd + "\n")
+        if cmd.startswith(("CRTBNDRPG", "CRTSQLRPGI", "CRTBNDCL", "CRTRPGMOD", "CRTCLMOD",
+                           "CRTDSPF", "CRTPRTF", "CRTPF", "CRTLF")):
+            m = __import__("re").search(r"(PGM|OBJ|MODULE|FILE)\((\w+)/(\w+)\) "
+                                        r"(?:SRCSTMF\('([^']+)'\)|SRCFILE\((\w+/\w+)\) "
+                                        r"SRCMBR\((\w+)\))", cmd)
             lib, obj, path = m.group(2), m.group(3), m.group(4)
-            src = open(real(path)).read() if os.path.exists(real(path)) else None
+            if path:
+                src = open(real(path)).read() if os.path.exists(real(path)) else None
+            else:
+                path = "%s(%s)" % (m.group(5), m.group(6))
+                src = MEMBERS.get(path)
             if src is None:
                 return dict(res, ok=False, messages=[{"id": "CPF9897", "severity": 40,
                             "type": 15, "text": "Source not found."}])
@@ -85,16 +97,57 @@ def handle(r):
                         "severity": 50 if bad else 0, "type": 15 if bad else 2,
                         "text": "Compilation stopped. Severity 30 errors found in program."
                         if bad else "Program %s placed in library %s." % (obj, lib)}])
+        if cmd.startswith("CPYFRMSTMF"):
+            m = __import__("re").search(r"FROMSTMF\('([^']+)'\) TOMBR\('/QSYS.LIB/(\w+).LIB/"
+                                        r"(\w+).FILE/(\w+).MBR'\)", cmd)
+            MEMBERS["%s/%s(%s)" % m.group(2, 3, 4)] = open(real(m.group(1))).read()
+            return dict(res, ok=True, messages=[])
+        if cmd.startswith("DLTSPLF"):
+            SPOOL[:] = [s for s in SPOOL if "FILE(%s)" % s[0] not in cmd]
+            return dict(res, ok=True, messages=[])
+        if cmd.startswith(("CRTSRVPGM", "CRTPGM", "RUNSQLSTM", "CRTBNDDIR", "ADDBNDDIRE",
+                           "DLTF", "CRTSRCPF")):
+            if cmd.startswith("RUNSQLSTM"):
+                path = __import__("re").search(r"SRCSTMF\('([^']+)'\)", cmd).group(1)
+                if "syntax error" in open(real(path)).read():
+                    stem = os.path.basename(path).split(".")[0].upper()
+                    SPOOL.insert(0, [stem, str(len(SPOOL) + 5), "654322/BOB/QPRTJOB", [
+                        "Record  *...+... 1", "MSG ID  SEV  RECORD  TEXT",
+                        "SQL0104  30       2  Position 8 Token SYNTAX was not valid.",
+                        "                    Message Summary"]])
+                    return dict(res, ok=False, messages=[{"id": "SQL9010", "severity": 30,
+                                "type": 15, "text": "RUNSQLSTM command failed."}])
+            return dict(res, ok=True, messages=[])
         if cmd.startswith("DLYJOB") or cmd.startswith("DSP"):
             return dict(res, ok=True, messages=[])
         return dict(res, ok=False, messages=[{"id": "CPD0030", "severity": 30, "type": 15,
                                               "text": "Command %s not found." % cmd.split()[0]}])
+    if op == "call_program":
+        if r.get("libl"):
+            LIBL[:] = r["libl"]
+        if r["program"].endswith("NOSUCH"):
+            return {"ok": False, "outputs": [None] * len(r["params"]), "job":
+                    "654321/QUSER/QZRCSRVS", "messages": [{"id": "CPF4101", "severity": 40,
+                    "type": 15, "text": "Program %s not found." % r["program"]}]}
+        nums = [float(p["value"]) for p in r["params"]
+                if not p["out"] and p["type"].startswith(("packed", "zoned", "int"))]
+        outs = [None if not p["out"] else
+                ("HELLO %s" % r["params"][0]["value"]).strip() if p["type"].startswith("char")
+                else sum(nums) for p in r["params"]]
+        return {"ok": True, "outputs": outs, "job": "654321/QUSER/QZRCSRVS",
+                "messages": [], "libl": list(LIBL) or None}
+    if op == "ifs_mkdir":
+        os.makedirs(real(r["path"]), exist_ok=True)
+        return True
     if op == "read_member":
         k = (r["lib"], r["member"])
         if r["file"] != "EVFEVENT" or k not in EVF:
             raise Exception("SQL0204: %s in %s type *FILE not found." % (r["file"], r["lib"]))
         return {"records": EVF[k]}
     if op == "spooled_file":
+        hit = next((s for s in SPOOL if s[0] == r["file"]), None)
+        if hit:
+            return {"lines": hit[3], "truncated": False}
         if not r["job"].endswith("/QPRTJOB"):
             return {"lines": [], "truncated": False}
         return {"lines": ["PAGE 1", "REPORT FOR %s" % r["job"], "TOTAL 42"], "truncated": False}
@@ -109,7 +162,8 @@ def handle(r):
                                         "Ownership changed."]], "params": r["params"]}
     if op == "query" and "SPOOLED_FILE_INFO" in r["sql"]:
         return {"columns": ["SPOOLED_FILE_NAME", "SPOOLED_FILE_NUMBER", "QUALIFIED_JOB_NAME"],
-                "types": [], "rows": [["QPRTLIBL", "1", "654322/BOB/QPRTJOB"]],
+                "types": [], "rows": [s[:3] for s in SPOOL] + [["QPRTLIBL", "1",
+                                                                  "654322/BOB/QPRTJOB"]],
                 "truncated": False, "params": r["params"]}
     if op == "query":
         if not r["sql"].lstrip().upper().startswith(("SELECT", "WITH", "VALUES")):
